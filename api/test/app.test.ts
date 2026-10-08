@@ -268,5 +268,55 @@ for (const backend of backends) {
       }
       assert.equal((await app.inject({ method: "GET", url: "/health" })).statusCode, 200);
     });
+
+    test("event stream pushes player and catalog changes to other servers", async () => {
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      const { port } = app.server.address() as { port: number };
+      try {
+        const unauthorized = await fetch(`http://127.0.0.1:${port}/v1/events`);
+        assert.equal(unauthorized.status, 401);
+
+        const res = await fetch(`http://127.0.0.1:${port}/v1/events`, { headers: server() });
+        assert.equal(res.status, 200);
+        assert.match(res.headers.get("content-type") ?? "", /text\/event-stream/);
+        const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
+        let buffered = "";
+        const nextEvent = async (): Promise<{ event: string; data: unknown }> => {
+          for (;;) {
+            const end = buffered.indexOf("\n\n");
+            if (end >= 0) {
+              const block = buffered.slice(0, end);
+              buffered = buffered.slice(end + 2);
+              const event = /^event: (.*)$/m.exec(block)?.[1];
+              const data = /^data: (.*)$/m.exec(block)?.[1];
+              if (event && data) return { event, data: JSON.parse(data) };
+              continue; // comment (connected / ping)
+            }
+            const { value, done } = await reader.read();
+            if (done) throw new Error("stream ended");
+            buffered += value;
+          }
+        };
+
+        await app.inject({ method: "POST", url: `/v1/players/${PLAYER}/grants`, headers: admin, payload: { cosmeticId: "top_hat" } });
+        assert.deepEqual(await nextEvent(), {
+          event: "player",
+          data: { type: "player", uuid: PLAYER_DASHED, owned: ["top_hat"], equipped: {} },
+        });
+
+        await app.inject({ method: "PUT", url: `/v1/players/${PLAYER}/equipped/head`, headers: server(), payload: { cosmeticId: "top_hat" } });
+        assert.deepEqual(await nextEvent(), {
+          event: "player",
+          data: { type: "player", uuid: PLAYER_DASHED, owned: ["top_hat"], equipped: { head: "top_hat" } },
+        });
+
+        await app.inject({ method: "PUT", url: "/v1/cosmetics/red_dust", headers: admin, payload: { name: "Red Dust", type: "TRAIL", data: { particle: "DUST", color: "#ff0000" } } });
+        assert.deepEqual(await nextEvent(), { event: "catalog", data: { type: "catalog", id: "red_dust" } });
+
+        await reader.cancel();
+      } finally {
+        await app.close();
+      }
+    });
   });
 }

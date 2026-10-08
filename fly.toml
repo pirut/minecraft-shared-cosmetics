@@ -1,10 +1,10 @@
-# Fly.io config for the central API. See "Hosting on Fly.io" in the repo README.
+# Fly.io config for the central API. Deploy from the repo root; see "Hosting on Fly.io" in the README.
 # Set your own app name with `fly launch --no-deploy --copy-config` or edit `app` below.
 app = "shared-cosmetics-api"
 primary_region = "iad"
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = "api/Dockerfile"
 
 [env]
   PORT = "8080"
@@ -14,7 +14,8 @@ primary_region = "iad"
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  # Plugins hold /v1/events open; keep the machine up rather than stopping it when traffic is quiet.
+  auto_stop_machines = "off"
   auto_start_machines = true
   min_machines_running = 1
 

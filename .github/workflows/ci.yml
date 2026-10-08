@@ -37,7 +37,7 @@ jobs:
       - run: npm test
         env:
           TEST_DATABASE_URL: postgres://msc:msc@localhost:5432/msc_test
-      - run: docker build -t shared-cosmetics-api .
+      - run: docker build -f api/Dockerfile -t shared-cosmetics-api ..
 
   plugin:
     runs-on: ubuntu-latest

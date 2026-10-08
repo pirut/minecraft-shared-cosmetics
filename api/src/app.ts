@@ -2,6 +2,8 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import rateLimit from "@fastify/rate-limit";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { SLOT_FOR_TYPE, type CosmeticType, type Store } from "./db.ts";
+import type { ResourcePack } from "./pack.ts";
+import { ChangeFeed } from "./events.ts";
 
 export interface RateLimitOptions {
   /** Requests per window for each server key. */
@@ -22,6 +24,12 @@ export interface AppOptions {
   trustProxy?: boolean;
   /** `false` turns rate limiting off. */
   rateLimit?: RateLimitOptions | false;
+  /** The shared resource pack, served at /v1/pack/<sha1>.zip. Omit to run without one. */
+  pack?: ResourcePack;
+  /** Where players download the pack if it's hosted elsewhere (a CDN). Must serve the same bytes. */
+  packUrl?: string;
+  /** How often the event stream sends a keep-alive comment, so servers can spot dead connections. */
+  heartbeatMs?: number;
 }
 
 type Caller = { kind: "admin" } | { kind: "server"; id: string } | { kind: "anonymous" };
@@ -64,6 +72,21 @@ function safeEqual(a: string, b: string): boolean {
 export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   const { store, adminToken } = opts;
   const app = Fastify({ logger: opts.logger ?? false, trustProxy: opts.trustProxy ?? false });
+  const feed = new ChangeFeed();
+  const closeStreams = new Set<() => void>();
+
+  const publishPlayer = async (uuid: string) =>
+    feed.publish({
+      type: "player",
+      uuid,
+      owned: (await store.ownedCosmetics(uuid)).map((c) => c.id),
+      equipped: await store.equipped(uuid),
+    });
+
+  // Open event streams would otherwise keep app.close() waiting forever.
+  app.addHook("preClose", async () => {
+    for (const close of closeStreams) close();
+  });
 
   // Work out who is calling up front so the rate limiter can key on it; routes enforce access below.
   app.decorateRequest<Caller | null>("caller", null);
@@ -111,6 +134,24 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   // Public: the whole catalog, so servers can cache render hints.
   app.get("/v1/cosmetics", async () => ({ cosmetics: await store.listCosmetics() }));
 
+  // Public: what servers send players on join. Clients verify the download against sha1.
+  app.get("/v1/pack", async (_req, reply) => {
+    const { pack, packUrl } = opts;
+    if (!pack) return reply.code(404).send({ error: "no resource pack configured" });
+    const path = `/v1/pack/${pack.sha1}.zip`;
+    return { sha1: pack.sha1, size: pack.zip.length, path, ...(packUrl ? { url: packUrl } : {}) };
+  });
+
+  // The hash is in the path so caches and CDNs never serve a stale pack under a new hash.
+  app.get<{ Params: { file: string } }>("/v1/pack/:file", async (req, reply) => {
+    const { pack } = opts;
+    if (!pack || req.params.file !== `${pack.sha1}.zip`) return reply.code(404).send({ error: "unknown pack" });
+    return reply
+      .header("Content-Type", "application/zip")
+      .header("Cache-Control", "public, max-age=31536000, immutable")
+      .send(pack.zip);
+  });
+
   app.put<{ Params: { id: string }; Body: { name: string; type: CosmeticType; data?: Record<string, unknown> } }>(
     "/v1/cosmetics/:id",
     {
@@ -128,7 +169,11 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         },
       },
     },
-    async (req) => store.upsertCosmetic({ id: req.params.id, name: req.body.name, type: req.body.type, data: req.body.data ?? {} }),
+    async (req) => {
+      const cosmetic = await store.upsertCosmetic({ id: req.params.id, name: req.body.name, type: req.body.type, data: req.body.data ?? {} });
+      feed.publish({ type: "catalog", id: cosmetic.id });
+      return cosmetic;
+    },
   );
 
   // Registers a server and returns its API key. The key is only shown once.
@@ -196,6 +241,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       if (!uuid) return;
       if (!(await store.getCosmetic(req.body.cosmeticId))) return reply.code(404).send({ error: "unknown cosmetic" });
       await store.grant(uuid, req.body.cosmeticId);
+      await publishPlayer(uuid);
       return reply.code(204).send();
     },
   );
@@ -223,6 +269,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       // Servers may only equip what the player already owns; only admins grant.
       if (!(await store.owns(uuid, cosmetic.id))) return reply.code(403).send({ error: "player does not own this cosmetic" });
       await store.equip(uuid, req.params.slot, cosmetic.id);
+      await publishPlayer(uuid);
       return { uuid, equipped: await store.equipped(uuid) };
     },
   );
@@ -234,9 +281,40 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       const uuid = playerUuid(req, reply);
       if (!uuid) return;
       await store.unequip(uuid, req.params.slot);
+      await publishPlayer(uuid);
       return { uuid, equipped: await store.equipped(uuid) };
     },
   );
+
+  // Server-sent events: every change to any player or the catalog, as it happens, so a cosmetic
+  // equipped on one server shows up on the others without the player rejoining.
+  // One API instance only for now: with several behind a load balancer, each server only hears
+  // changes made through the instance it's connected to (see events.ts).
+  app.get("/v1/events", { preHandler: requireServer }, (req, reply) => {
+    reply.hijack();
+    const res = reply.raw;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      // Stops nginx and similar proxies from buffering the stream.
+      "X-Accel-Buffering": "no",
+    });
+    res.write(": connected\n\n");
+
+    const unsubscribe = feed.subscribe((event) => {
+      res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    });
+    const heartbeat = setInterval(() => res.write(": ping\n\n"), opts.heartbeatMs ?? 25_000);
+    const close = () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      closeStreams.delete(close);
+      res.end();
+    };
+    closeStreams.add(close);
+    req.raw.on("close", close);
+  });
 
   return app;
 }
