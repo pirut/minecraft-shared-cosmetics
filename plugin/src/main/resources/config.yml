@@ -1,11 +1,33 @@
 # Base URL of the shared cosmetics API.
 api-url: "http://localhost:8080"
 # This server's key, issued once by POST /v1/servers on the API.
+# Servers on one Velocity/BungeeCord network can share a key; install the plugin on every backend
+# server, not on the proxy.
 server-key: ""
-# How high above the player's mount point the hat is drawn, in blocks.
-hat-offset-y: -0.25
-# How often trails emit particles, in ticks.
+# Keep a connection open to the API so cosmetics changed on another server (or by an admin) show up
+# here right away instead of at the player's next join.
+live-sync: true
+# How often hats follow the player's pose and trails emit particles, in ticks.
 trail-interval-ticks: 2
+
+# Where hats sit. The hat rides the top of the player's hitbox, which moves with the pose; these
+# numbers place it relative to the neck. The defaults come from the vanilla player model. If a hat
+# looks off in game, adjust here and restart.
+hat:
+  # Distance from the neck up to the hat, in blocks. Raise it for hats that should sit higher.
+  height: 0.14
+  poses:
+    # up: blocks from the top of the hitbox down to the neck (negative is down).
+    # along: blocks forward along the body: horizontal when upright, along the look direction when
+    # swimming or gliding.
+    standing: { up: -0.39, along: 0.0 }
+    sneaking: { up: -0.46, along: 0.0 }
+    # Also used when crawling under a one-block gap.
+    swimming: { up: -0.3, along: 0.4 }
+    # Flying with an elytra.
+    gliding: { up: -0.6, along: 1.4 }
+  # Hats are hidden while sleeping and during riptide spins.
+
 # The shared resource pack holds the custom hat models. Players' clients download it straight
 # from the API (or the CDN the API points at), not from this server.
 resource-pack:

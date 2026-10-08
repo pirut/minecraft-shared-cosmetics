@@ -2,6 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { SLOT_FOR_TYPE, Store, type CosmeticType } from "./db.ts";
 import type { ResourcePack } from "./pack.ts";
+import { ChangeFeed } from "./events.ts";
 
 export interface AppOptions {
   store: Store;
@@ -12,6 +13,8 @@ export interface AppOptions {
   pack?: ResourcePack;
   /** Where players download the pack if it's hosted elsewhere (a CDN). Must serve the same bytes. */
   packUrl?: string;
+  /** How often the event stream sends a keep-alive comment, so servers can spot dead connections. */
+  heartbeatMs?: number;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
@@ -42,6 +45,21 @@ function safeEqual(a: string, b: string): boolean {
 export function buildApp(opts: AppOptions): FastifyInstance {
   const { store, adminToken } = opts;
   const app = Fastify({ logger: opts.logger ?? false });
+  const feed = new ChangeFeed();
+  const closeStreams = new Set<() => void>();
+
+  const publishPlayer = (uuid: string) =>
+    feed.publish({
+      type: "player",
+      uuid,
+      owned: store.ownedCosmetics(uuid).map((c) => c.id),
+      equipped: store.equipped(uuid),
+    });
+
+  // Open event streams would otherwise keep app.close() waiting forever.
+  app.addHook("preClose", async () => {
+    for (const close of closeStreams) close();
+  });
 
   const requireAdmin = async (req: FastifyRequest, reply: FastifyReply) => {
     const token = bearer(req);
@@ -102,7 +120,11 @@ export function buildApp(opts: AppOptions): FastifyInstance {
         },
       },
     },
-    async (req) => store.upsertCosmetic({ id: req.params.id, name: req.body.name, type: req.body.type, data: req.body.data ?? {} }),
+    async (req) => {
+      const cosmetic = store.upsertCosmetic({ id: req.params.id, name: req.body.name, type: req.body.type, data: req.body.data ?? {} });
+      feed.publish({ type: "catalog", id: cosmetic.id });
+      return cosmetic;
+    },
   );
 
   // Registers a server and returns its API key. The key is only shown once.
@@ -139,6 +161,7 @@ export function buildApp(opts: AppOptions): FastifyInstance {
       if (!uuid) return;
       if (!store.getCosmetic(req.body.cosmeticId)) return reply.code(404).send({ error: "unknown cosmetic" });
       store.grant(uuid, req.body.cosmeticId);
+      publishPlayer(uuid);
       return reply.code(204).send();
     },
   );
@@ -166,6 +189,7 @@ export function buildApp(opts: AppOptions): FastifyInstance {
       // Servers may only equip what the player already owns; only admins grant.
       if (!store.owns(uuid, cosmetic.id)) return reply.code(403).send({ error: "player does not own this cosmetic" });
       store.equip(uuid, req.params.slot, cosmetic.id);
+      publishPlayer(uuid);
       return { uuid, equipped: store.equipped(uuid) };
     },
   );
@@ -177,9 +201,38 @@ export function buildApp(opts: AppOptions): FastifyInstance {
       const uuid = playerUuid(req, reply);
       if (!uuid) return;
       store.unequip(uuid, req.params.slot);
+      publishPlayer(uuid);
       return { uuid, equipped: store.equipped(uuid) };
     },
   );
+
+  // Server-sent events: every change to any player or the catalog, as it happens, so a cosmetic
+  // equipped on one server shows up on the others without the player rejoining.
+  app.get("/v1/events", { preHandler: requireServer }, (req, reply) => {
+    reply.hijack();
+    const res = reply.raw;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      // Stops nginx and similar proxies from buffering the stream.
+      "X-Accel-Buffering": "no",
+    });
+    res.write(": connected\n\n");
+
+    const unsubscribe = feed.subscribe((event) => {
+      res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    });
+    const heartbeat = setInterval(() => res.write(": ping\n\n"), opts.heartbeatMs ?? 25_000);
+    const close = () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      closeStreams.delete(close);
+      res.end();
+    };
+    closeStreams.add(close);
+    req.raw.on("close", close);
+  });
 
   return app;
 }

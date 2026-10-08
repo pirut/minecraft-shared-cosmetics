@@ -1,5 +1,10 @@
 package dev.sharedcosmetics;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import java.io.File;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -14,6 +19,7 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.command.TabExecutor;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -32,6 +38,7 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
     private CosmeticRenderer renderer;
     /** Null when resource-pack.enabled is false. */
     private ResourcePackSender packSender;
+    private LiveSync liveSync;
 
     @Override
     public void onEnable() {
@@ -42,8 +49,11 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
-        api = new ApiClient(getConfig().getString("api-url", "http://localhost:8080"), key);
-        renderer = new CosmeticRenderer(this, catalog::get, (float) getConfig().getDouble("hat-offset-y", -0.25));
+        String apiUrl = getConfig().getString("api-url", "http://localhost:8080");
+        api = new ApiClient(apiUrl, key);
+        int tickInterval = Math.max(1, getConfig().getInt("trail-interval-ticks", 2));
+        renderer = new CosmeticRenderer(this, catalog::get, HatPlacement.fromConfig(getConfig().getConfigurationSection("hat")), tickInterval);
+        warnIfUuidsUntrusted();
 
         getServer().getPluginManager().registerEvents(this, this);
         if (getConfig().getBoolean("resource-pack.enabled", true)) {
@@ -55,12 +65,46 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
         if (command != null) command.setExecutor(this);
 
         getServer().getScheduler().runTaskTimerAsynchronously(this, this::refreshCatalog, 0L, CATALOG_REFRESH_TICKS);
-        getServer().getScheduler().runTaskTimer(this, renderer::tick, 1L, Math.max(1, getConfig().getLong("trail-interval-ticks", 2)));
+        getServer().getScheduler().runTaskTimer(this, renderer::tick, 1L, tickInterval);
+
+        if (getConfig().getBoolean("live-sync", true)) {
+            liveSync = new LiveSync(apiUrl, key, getLogger(), this::resync, this::onLiveEvent);
+            liveSync.start();
+        }
     }
 
     @Override
     public void onDisable() {
+        if (liveSync != null) liveSync.stop();
         if (renderer != null) renderer.clearAll();
+    }
+
+    /**
+     * Cosmetics are keyed by Mojang account UUID (version 4). Offline-mode servers and proxies hand out
+     * name-based version 3 UUIDs (Floodgate's Bedrock UUIDs are version 0), which anyone could claim,
+     * so those players are left out rather than reading or writing someone else's cosmetics.
+     */
+    static boolean hasMojangUuid(Player player) {
+        return player.getUniqueId().version() == 4;
+    }
+
+    /** Explains at startup why players would be skipped, and the BungeeCord forwarding caveat. */
+    private void warnIfUuidsUntrusted() {
+        if (getServer().getOnlineMode()) return;
+        boolean bungee = getServer().spigot().getConfig().getBoolean("settings.bungeecord", false);
+        YamlConfiguration paper = YamlConfiguration.loadConfiguration(new File("config", "paper-global.yml"));
+        boolean velocity = paper.getBoolean("proxies.velocity.enabled", false);
+        if (velocity) {
+            if (!paper.getBoolean("proxies.velocity.online-mode", true)) {
+                getLogger().warning("The Velocity proxy is in offline mode, so players won't get shared cosmetics. Set online-mode = true in velocity.toml.");
+            }
+        } else if (bungee) {
+            getLogger().warning("Behind BungeeCord: make sure the proxy runs online-mode=true and this server only accepts connections"
+                    + " from the proxy (firewall), otherwise players can spoof UUIDs. Velocity modern forwarding avoids this.");
+        } else {
+            getLogger().severe("This server runs in offline mode without proxy forwarding, so player UUIDs can't be trusted."
+                    + " Shared cosmetics stay off for every player until online-mode=true or Velocity/BungeeCord forwarding is enabled.");
+        }
     }
 
     private void refreshCatalog() {
@@ -70,9 +114,10 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
                 return;
             }
             Map<String, Cosmetic> fresh = cosmetics.stream().collect(Collectors.toMap(Cosmetic::id, c -> c));
+            if (fresh.equals(new HashMap<>(catalog))) return;
             catalog.keySet().retainAll(fresh.keySet());
             catalog.putAll(fresh);
-            onMain(() -> renderer.reapplyAll());
+            onMain(() -> renderer.catalogChanged());
         });
         if (packSender == null) return;
         api.fetchPack().whenComplete((pack, error) -> {
@@ -84,7 +129,37 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
         });
     }
 
+    /** After live sync (re)connects: catch up on anything missed while it was down. */
+    private void resync() {
+        refreshCatalog();
+        for (Player player : getServer().getOnlinePlayers()) loadPlayer(player);
+    }
+
+    /** A change pushed by the API, made on this server, another server, or by an admin. Runs off the main thread. */
+    private void onLiveEvent(String event, JsonObject data) {
+        switch (event) {
+            case "catalog" -> refreshCatalog();
+            case "player" -> {
+                UUID uuid = UUID.fromString(data.get("uuid").getAsString());
+                Set<String> ownedIds = new HashSet<>();
+                for (JsonElement id : data.getAsJsonArray("owned")) ownedIds.add(id.getAsString());
+                Map<String, String> equipped = new HashMap<>();
+                data.getAsJsonObject("equipped").entrySet().forEach(e -> equipped.put(e.getKey(), e.getValue().getAsString()));
+                onMain(() -> {
+                    Player player = getServer().getPlayer(uuid);
+                    if (player == null || !hasMojangUuid(player)) return;
+                    owned.put(uuid, ownedIds);
+                    renderer.apply(player, equipped);
+                });
+            }
+            default -> {
+                // Newer API versions may add event types; ignore what we don't know.
+            }
+        }
+    }
+
     private void loadPlayer(Player player) {
+        if (!hasMojangUuid(player)) return;
         UUID uuid = player.getUniqueId();
         api.fetchPlayer(uuid).whenComplete((profile, error) -> {
             if (error != null) {
@@ -114,6 +189,10 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (!(sender instanceof Player player)) {
             sender.sendMessage("Only players can use this command.");
+            return true;
+        }
+        if (!hasMojangUuid(player)) {
+            player.sendMessage(Component.text("Shared cosmetics need a Mojang account, and this server can't verify yours.", NamedTextColor.RED));
             return true;
         }
         String sub = args.length == 0 ? "list" : args[0].toLowerCase();
