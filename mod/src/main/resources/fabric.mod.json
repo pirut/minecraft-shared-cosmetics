@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "sharedcosmetics",
+  "version": "${version}",
+  "name": "Shared Cosmetics",
+  "description": "Draws full animated shared cosmetics on every player, on any server.",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.sharedcosmetics.client.SharedCosmeticsClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.10",
+    "fabric-api": "*",
+    "minecraft": "~1.21.4"
+  }
+}

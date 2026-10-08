@@ -2,6 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import rateLimit from "@fastify/rate-limit";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
+import { BundleError, MAX_BUNDLE_BYTES, validateBundle } from "./bundle.ts";
 import { KIT_SCHEMA } from "./kit.ts";
 import { SLOT_FOR_TYPE, type CosmeticType, type Store } from "./db.ts";
 import type { ResourcePack } from "./pack.ts";
@@ -77,6 +78,20 @@ declare module "fastify" {
 /** How long an old key keeps working after a rotation unless the admin says otherwise. */
 const DEFAULT_ROTATION_GRACE_SECONDS = 24 * 60 * 60;
 const MAX_ROTATION_GRACE_SECONDS = 7 * 24 * 60 * 60;
+
+const BUNDLE_RE = "^[0-9a-f]{64}$";
+
+/** What the client mod draws for a cosmetic: a model bundle attached to one bone. */
+const MODEL_SCHEMA = {
+  type: "object",
+  required: ["bundle", "bone"],
+  additionalProperties: false,
+  properties: {
+    bundle: { type: "string", pattern: BUNDLE_RE },
+    bone: { type: "string", enum: ["head", "body", "left_arm", "right_arm", "left_leg", "right_leg"] },
+    animations: { type: "array", maxItems: 8, items: { type: "string", pattern: "^[a-z0-9_.]{1,64}$" } },
+  },
+};
 
 const UUID_RE = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
 const ID_RE = "^[a-z0-9_]{1,64}$";
@@ -218,6 +233,56 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       .send(pack.zip);
   });
 
+  // Model bundles for the client mod. Uploads are raw zip bytes; the id is their SHA-256.
+  app.addContentTypeParser(["application/zip", "application/octet-stream"], { parseAs: "buffer", bodyLimit: MAX_BUNDLE_BYTES }, (_req, body, done) =>
+    done(null, body),
+  );
+
+  app.put<{ Body: Buffer }>("/v1/assets", { preHandler: requireAdmin }, async (req, reply) => {
+    if (!Buffer.isBuffer(req.body)) return reply.code(415).send({ error: "send the bundle as application/zip" });
+    let id: string;
+    try {
+      id = validateBundle(req.body);
+    } catch (e) {
+      if (e instanceof BundleError) return reply.code(400).send({ error: e.message });
+      throw e;
+    }
+    await store.putAsset(id, req.body);
+    return reply.code(201).send({ id, size: req.body.length });
+  });
+
+  app.get<{ Params: { id: string } }>(
+    "/v1/assets/:id",
+    { schema: { params: { type: "object", properties: { id: { type: "string", pattern: BUNDLE_RE } } } } },
+    async (req, reply) => {
+      const data = await store.getAsset(req.params.id);
+      if (!data) return reply.code(404).send({ error: "unknown asset" });
+      return reply
+        .header("Content-Type", "application/zip")
+        .header("Cache-Control", "public, max-age=31536000, immutable")
+        .send(data);
+    },
+  );
+
+  // Public: what a batch of players has equipped, for the client mod to draw. It's no more than
+  // anyone near those players can already see, so it needs no key.
+  app.post<{ Body: { players: string[] } }>(
+    "/v1/equipped",
+    {
+      schema: {
+        body: {
+          type: "object",
+          required: ["players"],
+          properties: { players: { type: "array", maxItems: 100, items: { type: "string", maxLength: 36 } } },
+        },
+      },
+    },
+    async (req) => {
+      const uuids = [...new Set(req.body.players.map(normalizeUuid).filter((u): u is string => !!u))];
+      return { players: await store.equippedMany(uuids) };
+    },
+  );
+
   app.put<{
     Params: { id: string };
     Body: { name: string; type: CosmeticType; claimable?: boolean; data?: Record<string, unknown> };
@@ -234,12 +299,14 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
             name: { type: "string", minLength: 1, maxLength: 64 },
             type: { type: "string", enum: Object.keys(SLOT_FOR_TYPE) },
             claimable: { type: "boolean" },
-            data: { type: "object", properties: { kit: KIT_SCHEMA } },
+            data: { type: "object", properties: { kit: KIT_SCHEMA, model: MODEL_SCHEMA } },
           },
         },
       },
     },
-    async (req) => {
+    async (req, reply) => {
+      const bundle = (req.body.data?.model as { bundle?: string } | undefined)?.bundle;
+      if (bundle && !(await store.getAsset(bundle))) return reply.code(400).send({ error: "model bundle has not been uploaded" });
       const cosmetic = await store.upsertCosmetic({
         id: req.params.id,
         name: req.body.name,

@@ -55,6 +55,9 @@ Web pages:
 | --- | --- | --- | --- |
 | GET | `/v1/cosmetics` | none | Full catalog with render hints |
 | GET | `/v1/pack` | none | Resource pack SHA-1 and download path (or CDN `url`) |
+| POST | `/v1/equipped` | none | Equipped cosmetics for up to 100 players, for the client mod |
+| PUT | `/v1/assets` | admin | Upload a model bundle (zip), returns its SHA-256 id |
+| GET | `/v1/assets/:sha256` | none | A model bundle |
 | GET | `/v1/pack/:sha1.zip` | none | The resource pack itself |
 | PUT | `/v1/cosmetics/:id` | admin | Create or update a cosmetic (`claimable: true` lets players claim it) |
 | POST | `/v1/servers` | admin | Register a server, returns its key once |
@@ -77,7 +80,7 @@ Web pages:
 
 `/v1/events` streams a `player` event (`{uuid, owned, equipped}`) whenever a player's cosmetics change (grant, revoke, web claim, equip or unequip from a server or the web page), and a `catalog` event (`{id}`) when a cosmetic is created or updated, with a keep-alive comment every 25 seconds. The plugin uses it so a change on one server shows up on every other server straight away. Events fan out in-process, so this works with a single API instance; several instances would need a shared bus such as Postgres `LISTEN/NOTIFY`.
 
-Cosmetic types and their slots: `HAT` → `head`, `TRAIL` → `trail`.
+Cosmetic types and their slots: `HAT` → `head`, `TRAIL` → `trail`, and for the client mod only `BACK` → `back`, `PET` → `pet`, `AURA` → `aura`.
 
 **Rate limits.** Each server key gets its own bucket, because many Minecraft hosts put dozens of servers behind one IP. Calls with no key or a wrong key share a per-IP bucket, which also slows down key guessing. The admin token and `/health` are never limited. Over the limit you get `429` with a `retry-after` header. Counters live in each instance's memory, so with N instances the effective limit is up to N times higher.
 
@@ -145,6 +148,29 @@ The schema is created on first boot. Run one machine for now: live sync (`/v1/ev
 
 Any other host that runs a Docker image works the same way (`docker build -f api/Dockerfile .` from the repo root): set `ADMIN_TOKEN`, `DATABASE_URL`, and `TRUST_PROXY=true` if it sits behind a proxy.
 
+## Client mod (`mod/`)
+
+An optional Fabric mod (Minecraft 1.21.4, Fabric API) for players who want the full versions: animated Blockbench models attached to the real player model, on any server, downloaded only the first time someone nearby wears one. The plugin and parts kit stay as the fallback for everyone without it. Design notes are in [docs/client-mod.md](docs/client-mod.md).
+
+```sh
+cd mod
+./gradlew build   # jar lands in build/libs/
+```
+
+Players set `api-url` in `config/sharedcosmetics.properties`. Every few seconds the mod asks the API what nearby players have equipped (one batched request), downloads any model bundle it hasn't seen, checks it against its hash, caches it in `sharedcosmetics/bundles/`, and draws it on the right bone with its animations looping. While a bundle downloads, a small colored box stands in for it.
+
+**Making a cosmetic for the mod.** Model it in Blockbench as a *Bedrock entity* with box UV, placing it relative to the player bone it attaches to: the origin is that bone's pivot (the neck for `head` and `body`, the shoulder for arms), y up, +z toward the player's back. Export `geometry.json`, the texture as `texture.png` (512px max) and optionally `animations.json`, zip those three files, then:
+
+```sh
+cd examples/phoenix_wings && zip -X ../phoenix_wings.zip geometry.json texture.png animations.json && cd ../..
+ID=$(curl -s -X PUT localhost:8080/v1/assets -H "$A" -H 'Content-Type: application/zip' \
+  --data-binary @examples/phoenix_wings.zip | jq -r .id)
+curl -X PUT localhost:8080/v1/cosmetics/phoenix_wings -H "$A" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Phoenix Wings\",\"type\":\"BACK\",\"data\":{\"model\":{\"bundle\":\"$ID\",\"bone\":\"body\",\"animations\":[\"idle\",\"flap\"]}}}"
+```
+
+Bundles are immutable: to change a model, upload a new bundle and point the cosmetic at it. Molang expressions and per-face UV aren't supported yet; numeric keyframes and box UV are.
+
 ## Plugin (`plugin/`)
 
 Paper 1.21.4+, Java 21.
@@ -180,6 +206,7 @@ A trail with bad data logs one warning and is skipped.
 
 - Paid cosmetics, gift or redeem codes, and achievement unlocks. Today players get cosmetics from an admin grant or by claiming free ones on the web page.
 - Running more than one API instance: live sync needs a shared bus (Postgres LISTEN/NOTIFY), and rate limit counters (including wrong link codes) need a shared store (Redis). Schema migrations are create-if-missing only.
-- Uploading assets through the API. Today a new model means a commit to `resourcepack/` and an API restart.
+- Uploading vanilla pack assets through the API. A new kit part means a commit to `resourcepack/` and an API restart. (Client mod bundles do upload through the API.)
+- Client mod: an in-game equip menu (signed in through Mojang's session check), hiding the plugin's vanilla hat for players who see the modded one, animations driven by movement, Molang, and an options screen. Nothing in the mod has been run in game yet.
 - Pre-1.20.3 clients (via ViaVersion) only hold one server pack, so for them the shared pack and the server's own pack replace each other.
 - The hat pose numbers are worked out from the vanilla player model and still need checking in game, elytra flight especially.

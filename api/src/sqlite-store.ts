@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { toCosmetic, type Cosmetic, type CosmeticRow, type PlayerInfo, type ServerInfo, type Store } from "./db.ts";
+import { groupEquipped, toCosmetic, type Cosmetic, type CosmeticRow, type PlayerInfo, type ServerInfo, type Store } from "./db.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cosmetics (
@@ -44,6 +44,11 @@ CREATE TABLE IF NOT EXISTS web_sessions (
   token_hash  TEXT PRIMARY KEY,
   player_uuid TEXT NOT NULL,
   expires_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS assets (
+  id         TEXT PRIMARY KEY,
+  data       BLOB NOT NULL,
+  created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS equipped (
   player_uuid TEXT NOT NULL,
@@ -249,5 +254,25 @@ export class SqliteStore implements Store {
 
   async unequip(playerUuid: string, slot: string): Promise<void> {
     this.db.prepare("DELETE FROM equipped WHERE player_uuid = ? AND slot = ?").run(playerUuid, slot);
+  }
+
+  async equippedMany(playerUuids: string[]): Promise<Record<string, Record<string, string>>> {
+    if (playerUuids.length === 0) return {};
+    const rows = this.db
+      .prepare(
+        `SELECT player_uuid, slot, cosmetic_id FROM equipped
+         WHERE player_uuid IN (${playerUuids.map(() => "?").join(", ")})`,
+      )
+      .all(...playerUuids) as unknown as { player_uuid: string; slot: string; cosmetic_id: string }[];
+    return groupEquipped(rows);
+  }
+
+  async putAsset(id: string, data: Buffer): Promise<void> {
+    this.db.prepare("INSERT OR IGNORE INTO assets (id, data, created_at) VALUES (?, ?, ?)").run(id, data, Date.now());
+  }
+
+  async getAsset(id: string): Promise<Buffer | undefined> {
+    const row = this.db.prepare("SELECT data FROM assets WHERE id = ?").get(id) as { data: Uint8Array } | undefined;
+    return row ? Buffer.from(row.data) : undefined;
   }
 }
