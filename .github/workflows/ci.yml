@@ -37,7 +37,8 @@ jobs:
       - run: npm test
         env:
           TEST_DATABASE_URL: postgres://msc:msc@localhost:5432/msc_test
-      - run: docker build -f api/Dockerfile -t shared-cosmetics-api ..
+      # Context is the repo root so the resource pack and web pages ship in the image.
+      - run: docker build -f Dockerfile -t shared-cosmetics-api ..
 
   plugin:
     runs-on: ubuntu-latest
