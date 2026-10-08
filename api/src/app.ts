@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { SLOT_FOR_TYPE, Store, type CosmeticType } from "./db.ts";
+import type { ResourcePack } from "./pack.ts";
 import { ChangeFeed } from "./events.ts";
 
 export interface AppOptions {
@@ -8,6 +9,10 @@ export interface AppOptions {
   /** Token for catalog management, server registration and grants. */
   adminToken: string;
   logger?: boolean;
+  /** The shared resource pack, served at /v1/pack/<sha1>.zip. Omit to run without one. */
+  pack?: ResourcePack;
+  /** Where players download the pack if it's hosted elsewhere (a CDN). Must serve the same bytes. */
+  packUrl?: string;
   /** How often the event stream sends a keep-alive comment, so servers can spot dead connections. */
   heartbeatMs?: number;
 }
@@ -79,6 +84,24 @@ export function buildApp(opts: AppOptions): FastifyInstance {
 
   // Public: the whole catalog, so servers can cache render hints.
   app.get("/v1/cosmetics", async () => ({ cosmetics: store.listCosmetics() }));
+
+  // Public: what servers send players on join. Clients verify the download against sha1.
+  app.get("/v1/pack", async (_req, reply) => {
+    const { pack, packUrl } = opts;
+    if (!pack) return reply.code(404).send({ error: "no resource pack configured" });
+    const path = `/v1/pack/${pack.sha1}.zip`;
+    return { sha1: pack.sha1, size: pack.zip.length, path, ...(packUrl ? { url: packUrl } : {}) };
+  });
+
+  // The hash is in the path so caches and CDNs never serve a stale pack under a new hash.
+  app.get<{ Params: { file: string } }>("/v1/pack/:file", async (req, reply) => {
+    const { pack } = opts;
+    if (!pack || req.params.file !== `${pack.sha1}.zip`) return reply.code(404).send({ error: "unknown pack" });
+    return reply
+      .header("Content-Type", "application/zip")
+      .header("Cache-Control", "public, max-age=31536000, immutable")
+      .send(pack.zip);
+  });
 
   app.put<{ Params: { id: string }; Body: { name: string; type: CosmeticType; data?: Record<string, unknown> } }>(
     "/v1/cosmetics/:id",
