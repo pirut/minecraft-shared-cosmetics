@@ -8,6 +8,12 @@ if (!adminToken || adminToken.length < 16) {
 }
 
 const store = new Store(process.env.DATABASE_PATH ?? "cosmetics.db");
-const app = buildApp({ store, adminToken, logger: true });
+const app = buildApp({
+  store,
+  adminToken,
+  publicUrl: process.env.PUBLIC_URL,
+  trustProxy: process.env.TRUST_PROXY === "1",
+  logger: true,
+});
 
 await app.listen({ host: process.env.HOST ?? "0.0.0.0", port: Number(process.env.PORT ?? 8080) });

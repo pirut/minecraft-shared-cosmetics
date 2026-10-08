@@ -4,9 +4,11 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -19,6 +21,8 @@ import java.util.concurrent.CompletableFuture;
 public final class ApiClient {
 
     public record PlayerProfile(List<Cosmetic> owned, Map<String, String> equipped) {}
+
+    public record LinkCode(String code, String url) {}
 
     public static final class ApiException extends RuntimeException {
         public ApiException(String message) {
@@ -45,14 +49,26 @@ public final class ApiClient {
         });
     }
 
-    public CompletableFuture<PlayerProfile> fetchPlayer(UUID player) {
-        return send(request("/v1/players/" + player).GET()).thenApply(json -> {
+    /** Also reports the player's current name so admins can look them up by it. */
+    public CompletableFuture<PlayerProfile> fetchPlayer(UUID player, String name) {
+        String query = "?name=" + URLEncoder.encode(name, StandardCharsets.UTF_8);
+        return send(request("/v1/players/" + player + query).GET()).thenApply(json -> {
             List<Cosmetic> owned = new ArrayList<>();
             for (JsonElement el : json.getAsJsonArray("owned")) {
                 owned.add(Cosmetic.fromJson(el.getAsJsonObject()));
             }
             return new PlayerProfile(owned, equippedFrom(json));
         });
+    }
+
+    /** A one-time code the player enters on the web page to link it to this account. */
+    public CompletableFuture<LinkCode> createLinkCode(UUID player, String name) {
+        JsonObject body = new JsonObject();
+        body.addProperty("name", name);
+        HttpRequest.Builder req = request("/v1/players/" + player + "/link-codes")
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body.toString()));
+        return send(req).thenApply(json -> new LinkCode(json.get("code").getAsString(), json.get("url").getAsString()));
     }
 
     public CompletableFuture<Map<String, String>> equip(UUID player, String slot, String cosmeticId) {
