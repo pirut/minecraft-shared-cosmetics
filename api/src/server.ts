@@ -1,28 +1,48 @@
 import { existsSync } from "node:fs";
-import { buildApp } from "./app.ts";
-import { Store } from "./db.ts";
+import { buildApp, DEFAULT_RATE_LIMIT } from "./app.ts";
+import { openStore } from "./db.ts";
 import { DEFAULT_PACK_DIR, buildPack } from "./pack.ts";
 
-const adminToken = process.env.ADMIN_TOKEN;
+const env = process.env;
+
+const adminToken = env.ADMIN_TOKEN;
 if (!adminToken || adminToken.length < 16) {
   console.error("ADMIN_TOKEN must be set to a secret of at least 16 characters");
   process.exit(1);
 }
 
-const packDir = process.env.PACK_DIR ?? DEFAULT_PACK_DIR;
+const truthy = (v: string | undefined) => v === "1" || v === "true";
+const num = (v: string | undefined, fallback: number) => (v ? Number(v) : fallback);
+
+const packDir = env.PACK_DIR ?? DEFAULT_PACK_DIR;
 const pack = existsSync(packDir) ? buildPack(packDir) : undefined;
 
-const store = new Store(process.env.DATABASE_PATH ?? "cosmetics.db");
-const app = buildApp({
+// DATABASE_URL (postgres://...) for hosting; DATABASE_PATH (a SQLite file) for local runs.
+const store = await openStore(env.DATABASE_URL || env.DATABASE_PATH || "cosmetics.db");
+const app = await buildApp({
   store,
   adminToken,
-  publicUrl: process.env.PUBLIC_URL,
-  trustProxy: process.env.TRUST_PROXY === "1",
+  publicUrl: env.PUBLIC_URL || undefined,
   logger: true,
   pack,
-  packUrl: process.env.PACK_URL || undefined,
+  packUrl: env.PACK_URL || undefined,
+  trustProxy: truthy(env.TRUST_PROXY),
+  rateLimit: truthy(env.RATE_LIMIT_DISABLED)
+    ? false
+    : {
+        serverMax: num(env.RATE_LIMIT_SERVER_MAX, DEFAULT_RATE_LIMIT.serverMax),
+        anonymousMax: num(env.RATE_LIMIT_ANONYMOUS_MAX, DEFAULT_RATE_LIMIT.anonymousMax),
+        windowMs: num(env.RATE_LIMIT_WINDOW_MS, DEFAULT_RATE_LIMIT.windowMs),
+      },
 });
+app.addHook("onClose", () => store.close());
 if (pack) app.log.info({ sha1: pack.sha1, bytes: pack.zip.length }, `resource pack built from ${packDir}`);
 else app.log.warn(`no resource pack at ${packDir}; custom hat models won't load`);
 
-await app.listen({ host: process.env.HOST ?? "0.0.0.0", port: Number(process.env.PORT ?? 8080) });
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    app.close().then(() => process.exit(0));
+  });
+}
+
+await app.listen({ host: env.HOST ?? "0.0.0.0", port: Number(env.PORT ?? 8080) });

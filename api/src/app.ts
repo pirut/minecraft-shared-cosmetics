@@ -1,10 +1,21 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
+import rateLimit from "@fastify/rate-limit";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { KIT_SCHEMA } from "./kit.ts";
-import { SLOT_FOR_TYPE, Store, type CosmeticType } from "./db.ts";
+import { SLOT_FOR_TYPE, type CosmeticType, type Store } from "./db.ts";
 import type { ResourcePack } from "./pack.ts";
 import { ChangeFeed } from "./events.ts";
+
+export interface RateLimitOptions {
+  /** Requests per window for each server key. */
+  serverMax: number;
+  /** Requests per window for each IP without a valid key (public catalog, bad tokens). */
+  anonymousMax: number;
+  windowMs: number;
+}
+
+export const DEFAULT_RATE_LIMIT: RateLimitOptions = { serverMax: 600, anonymousMax: 60, windowMs: 60_000 };
 
 export interface AppOptions {
   store: Store;
@@ -12,9 +23,11 @@ export interface AppOptions {
   adminToken: string;
   /** Where players reach the web pages, e.g. https://cosmetics.example.com. Defaults to the request's host. */
   publicUrl?: string;
-  /** Trust X-Forwarded-* headers, when running behind a reverse proxy. */
-  trustProxy?: boolean;
   logger?: boolean;
+  /** Trust X-Forwarded-For from a load balancer (Fly, Railway, nginx) so per-IP limits see the real client. */
+  trustProxy?: boolean;
+  /** `false` turns rate limiting off. */
+  rateLimit?: RateLimitOptions | false;
   /** The shared resource pack, served at /v1/pack/<sha1>.zip. Omit to run without one. */
   pack?: ResourcePack;
   /** Where players download the pack if it's hosted elsewhere (a CDN). Must serve the same bytes. */
@@ -53,6 +66,18 @@ function cookie(req: FastifyRequest, name: string): string | undefined {
   return undefined;
 }
 
+type Caller = { kind: "admin" } | { kind: "server"; id: string } | { kind: "anonymous" };
+
+declare module "fastify" {
+  interface FastifyRequest {
+    caller: Caller;
+  }
+}
+
+/** How long an old key keeps working after a rotation unless the admin says otherwise. */
+const DEFAULT_ROTATION_GRACE_SECONDS = 24 * 60 * 60;
+const MAX_ROTATION_GRACE_SECONDS = 7 * 24 * 60 * 60;
+
 const UUID_RE = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
 const ID_RE = "^[a-z0-9_]{1,64}$";
 
@@ -78,7 +103,7 @@ function safeEqual(a: string, b: string): boolean {
   return ab.length === bb.length && timingSafeEqual(ab, bb);
 }
 
-export function buildApp(opts: AppOptions): FastifyInstance {
+export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   const { store, adminToken } = opts;
   const app = Fastify({ logger: opts.logger ?? false, trustProxy: opts.trustProxy ?? false });
   const publicUrl = (req: FastifyRequest) => (opts.publicUrl ?? `${req.protocol}://${req.host}`).replace(/\/+$/, "");
@@ -86,12 +111,12 @@ export function buildApp(opts: AppOptions): FastifyInstance {
   const feed = new ChangeFeed();
   const closeStreams = new Set<() => void>();
 
-  const publishPlayer = (uuid: string) =>
+  const publishPlayer = async (uuid: string) =>
     feed.publish({
       type: "player",
       uuid,
-      owned: store.ownedCosmetics(uuid).map((c) => c.id),
-      equipped: store.equipped(uuid),
+      owned: (await store.ownedCosmetics(uuid)).map((c) => c.id),
+      equipped: await store.equipped(uuid),
     });
 
   // Open event streams would otherwise keep app.close() waiting forever.
@@ -99,45 +124,67 @@ export function buildApp(opts: AppOptions): FastifyInstance {
     for (const close of closeStreams) close();
   });
 
-  const requireAdmin = async (req: FastifyRequest, reply: FastifyReply) => {
+  // Work out who is calling up front so the rate limiter can key on it; routes enforce access below.
+  app.decorateRequest<Caller | null>("caller", null);
+  app.addHook("onRequest", async (req) => {
     const token = bearer(req);
-    if (!token || !safeEqual(token, adminToken)) {
-      return reply.code(401).send({ error: "admin token required" });
+    if (token && safeEqual(token, adminToken)) {
+      req.caller = { kind: "admin" };
+      return;
     }
+    const server = token ? await store.findServerByKeyHash(hashKey(token)) : undefined;
+    req.caller = server ? { kind: "server", id: server.id } : { kind: "anonymous" };
+  });
+
+  const limits = opts.rateLimit === undefined ? DEFAULT_RATE_LIMIT : opts.rateLimit;
+  if (limits) {
+    // Must finish registering before routes are declared, or they won't be limited.
+    await app.register(rateLimit, {
+      // The plugin attaches its check to each route's onRequest, which runs after the app-level hook above.
+      timeWindow: limits.windowMs,
+      // Many Minecraft hosts put dozens of servers behind one IP, so valid keys get their own bucket.
+      keyGenerator: (req) => (req.caller.kind === "server" ? `server:${req.caller.id}` : `ip:${req.ip}`),
+      max: (_req, key) => (key.startsWith("server:") ? limits.serverMax : limits.anonymousMax),
+      allowList: (req) => req.caller.kind === "admin",
+    });
+  }
+
+  const requireAdmin = async (req: FastifyRequest, reply: FastifyReply) => {
+    if (req.caller.kind !== "admin") return reply.code(401).send({ error: "admin token required" });
   };
 
   const requireServer = async (req: FastifyRequest, reply: FastifyReply) => {
-    const token = bearer(req);
-    const server = token ? store.findServerByKeyHash(hashKey(token)) : undefined;
-    if (!server) return reply.code(401).send({ error: "valid server key required" });
+    if (req.caller.kind !== "server") return reply.code(401).send({ error: "valid server key required" });
   };
 
-  const sessionPlayer = (req: FastifyRequest): string | undefined => {
+  const sessionPlayer = async (req: FastifyRequest): Promise<string | undefined> => {
     const token = cookie(req, SESSION_COOKIE);
     return token ? store.findSession(hashKey(token)) : undefined;
   };
 
   const requireSession = async (req: FastifyRequest, reply: FastifyReply) => {
-    if (!sessionPlayer(req)) return reply.code(401).send({ error: "not linked" });
+    if (!(await sessionPlayer(req))) return reply.code(401).send({ error: "not linked" });
   };
 
-  const profile = (uuid: string) => ({
+  const profile = async (uuid: string) => ({
     uuid,
-    name: store.getPlayer(uuid)?.name ?? null,
-    owned: store.ownedCosmetics(uuid),
-    equipped: store.equipped(uuid),
+    name: (await store.getPlayer(uuid))?.name ?? null,
+    owned: await store.ownedCosmetics(uuid),
+    equipped: await store.equipped(uuid),
   });
 
   /** Shared by servers and the player's own web session; only owned cosmetics can be equipped. */
-  const equip = (uuid: string, slot: string, cosmeticId: string, reply: FastifyReply) => {
-    const cosmetic = store.getCosmetic(cosmeticId);
+  const equip = async (uuid: string, slot: string, cosmeticId: string, reply: FastifyReply) => {
+    const cosmetic = await store.getCosmetic(cosmeticId);
     if (!cosmetic) return reply.code(404).send({ error: "unknown cosmetic" });
     if (cosmetic.slot !== slot) return reply.code(400).send({ error: `cosmetic belongs in slot "${cosmetic.slot}"` });
-    if (!store.owns(uuid, cosmetic.id)) return reply.code(403).send({ error: "player does not own this cosmetic" });
-    store.equip(uuid, slot, cosmetic.id);
-    publishPlayer(uuid);
-    return { uuid, equipped: store.equipped(uuid) };
+    if (!(await store.owns(uuid, cosmetic.id))) return reply.code(403).send({ error: "player does not own this cosmetic" });
+    await store.equip(uuid, slot, cosmetic.id);
+    await publishPlayer(uuid);
+    return { uuid, equipped: await store.equipped(uuid) };
   };
+
+  const newServerKey = () => `msc_${randomBytes(24).toString("base64url")}`;
 
   const playerUuid = (req: FastifyRequest, reply: FastifyReply): string | undefined => {
     const uuid = normalizeUuid((req.params as { uuid: string }).uuid);
@@ -145,13 +192,13 @@ export function buildApp(opts: AppOptions): FastifyInstance {
     return uuid;
   };
 
-  app.get("/health", async () => ({ ok: true }));
+  app.get("/health", { config: { rateLimit: false } }, async () => ({ ok: true }));
 
   app.get("/", async (_req, reply) => reply.type("text/html; charset=utf-8").send(PAGES.player));
   app.get("/admin", async (_req, reply) => reply.type("text/html; charset=utf-8").send(PAGES.admin));
 
   // Public: the whole catalog, so servers can cache render hints.
-  app.get("/v1/cosmetics", async () => ({ cosmetics: store.listCosmetics() }));
+  app.get("/v1/cosmetics", async () => ({ cosmetics: await store.listCosmetics() }));
 
   // Public: what servers send players on join. Clients verify the download against sha1.
   app.get("/v1/pack", async (_req, reply) => {
@@ -193,7 +240,7 @@ export function buildApp(opts: AppOptions): FastifyInstance {
       },
     },
     async (req) => {
-      const cosmetic = store.upsertCosmetic({
+      const cosmetic = await store.upsertCosmetic({
         id: req.params.id,
         name: req.body.name,
         type: req.body.type,
@@ -220,17 +267,46 @@ export function buildApp(opts: AppOptions): FastifyInstance {
     },
     async (req, reply) => {
       const id = randomBytes(6).toString("hex");
-      const key = `msc_${randomBytes(24).toString("base64url")}`;
-      store.createServer(id, req.body.name, hashKey(key));
+      const key = newServerKey();
+      await store.createServer(id, req.body.name, hashKey(key));
       return reply.code(201).send({ id, name: req.body.name, key });
     },
   );
 
-  app.get("/v1/servers", { preHandler: requireAdmin }, async () => ({ servers: store.listServers() }));
+  app.get("/v1/servers", { preHandler: requireAdmin }, async () => ({ servers: await store.listServers() }));
+
+  // Issues a new key. The old one keeps working for `graceSeconds` (default 24h) so the
+  // server owner can update their config without downtime; pass 0 if the old key leaked.
+  app.post<{ Params: { id: string }; Body: { graceSeconds?: number } | undefined }>(
+    "/v1/servers/:id/rotate",
+    {
+      preHandler: requireAdmin,
+      schema: {
+        body: {
+          type: ["object", "null"],
+          properties: { graceSeconds: { type: "integer", minimum: 0, maximum: MAX_ROTATION_GRACE_SECONDS } },
+        },
+      },
+    },
+    async (req, reply) => {
+      const graceSeconds = req.body?.graceSeconds ?? DEFAULT_ROTATION_GRACE_SECONDS;
+      const key = newServerKey();
+      if (!(await store.rotateServerKey(req.params.id, hashKey(key), graceSeconds * 1000))) {
+        return reply.code(404).send({ error: "unknown or revoked server" });
+      }
+      return { id: req.params.id, key, oldKeysExpireInSeconds: graceSeconds };
+    },
+  );
+
+  // Permanently cuts a server off. Register it again to give it a fresh identity.
+  app.delete<{ Params: { id: string } }>("/v1/servers/:id", { preHandler: requireAdmin }, async (req, reply) => {
+    if (!(await store.revokeServer(req.params.id))) return reply.code(404).send({ error: "unknown server" });
+    return reply.code(204).send();
+  });
 
   // Admin lookup by uuid or by any name a server has reported.
   app.get<{ Params: { query: string } }>("/v1/admin/players/:query", { preHandler: requireAdmin }, async (req, reply) => {
-    const uuid = normalizeUuid(req.params.query) ?? store.findPlayerByName(req.params.query)?.uuid;
+    const uuid = normalizeUuid(req.params.query) ?? (await store.findPlayerByName(req.params.query))?.uuid;
     if (!uuid) return reply.code(404).send({ error: "no player with that uuid or name has been seen yet" });
     return profile(uuid);
   });
@@ -246,9 +322,9 @@ export function buildApp(opts: AppOptions): FastifyInstance {
     async (req, reply) => {
       const uuid = playerUuid(req, reply);
       if (!uuid) return;
-      if (!store.getCosmetic(req.body.cosmeticId)) return reply.code(404).send({ error: "unknown cosmetic" });
-      store.grant(uuid, req.body.cosmeticId);
-      publishPlayer(uuid);
+      if (!(await store.getCosmetic(req.body.cosmeticId))) return reply.code(404).send({ error: "unknown cosmetic" });
+      await store.grant(uuid, req.body.cosmeticId);
+      await publishPlayer(uuid);
       return reply.code(204).send();
     },
   );
@@ -259,8 +335,8 @@ export function buildApp(opts: AppOptions): FastifyInstance {
     async (req, reply) => {
       const uuid = playerUuid(req, reply);
       if (!uuid) return;
-      store.revoke(uuid, req.params.cosmeticId);
-      publishPlayer(uuid);
+      await store.revoke(uuid, req.params.cosmeticId);
+      await publishPlayer(uuid);
       return reply.code(204).send();
     },
   );
@@ -275,7 +351,7 @@ export function buildApp(opts: AppOptions): FastifyInstance {
     async (req, reply) => {
       const uuid = playerUuid(req, reply);
       if (!uuid) return;
-      if (req.query.name) store.seePlayer(uuid, req.query.name);
+      if (req.query.name) await store.seePlayer(uuid, req.query.name);
       return profile(uuid);
     },
   );
@@ -291,10 +367,10 @@ export function buildApp(opts: AppOptions): FastifyInstance {
     async (req, reply) => {
       const uuid = playerUuid(req, reply);
       if (!uuid) return;
-      if (req.body?.name) store.seePlayer(uuid, req.body.name);
+      if (req.body?.name) await store.seePlayer(uuid, req.body.name);
       const code = newLinkCode();
       const expiresAt = Date.now() + LINK_CODE_TTL_MS;
-      store.createLinkCode(code, uuid, expiresAt);
+      await store.createLinkCode(code, uuid, expiresAt);
       const display = `${code.slice(0, 4)}-${code.slice(4)}`;
       return reply.code(201).send({ code: display, expiresAt, url: `${publicUrl(req)}/?code=${display}` });
     },
@@ -322,9 +398,9 @@ export function buildApp(opts: AppOptions): FastifyInstance {
     async (req, reply) => {
       const uuid = playerUuid(req, reply);
       if (!uuid) return;
-      store.unequip(uuid, req.params.slot);
-      publishPlayer(uuid);
-      return { uuid, equipped: store.equipped(uuid) };
+      await store.unequip(uuid, req.params.slot);
+      await publishPlayer(uuid);
+      return { uuid, equipped: await store.equipped(uuid) };
     },
   );
 
@@ -338,7 +414,7 @@ export function buildApp(opts: AppOptions): FastifyInstance {
       if (failures && failures.resetAt > now && failures.count >= LINK_FAILURES_PER_WINDOW) {
         return reply.code(429).send({ error: "too many wrong codes, try again in a few minutes" });
       }
-      const uuid = store.consumeLinkCode(normalizeLinkCode(req.body.code));
+      const uuid = await store.consumeLinkCode(normalizeLinkCode(req.body.code));
       if (!uuid) {
         const entry = failures && failures.resetAt > now ? failures : { count: 0, resetAt: now + LINK_FAILURE_WINDOW_MS };
         entry.count++;
@@ -346,7 +422,7 @@ export function buildApp(opts: AppOptions): FastifyInstance {
         return reply.code(400).send({ error: "that code is wrong or has expired, run /cosmetics link again" });
       }
       const token = randomBytes(32).toString("base64url");
-      store.createSession(hashKey(token), uuid, now + SESSION_TTL_MS);
+      await store.createSession(hashKey(token), uuid, now + SESSION_TTL_MS);
       const secure = publicUrl(req).startsWith("https:") ? "; Secure" : "";
       reply.header(
         "Set-Cookie",
@@ -358,12 +434,12 @@ export function buildApp(opts: AppOptions): FastifyInstance {
 
   app.delete("/v1/session", async (req, reply) => {
     const token = cookie(req, SESSION_COOKIE);
-    if (token) store.deleteSession(hashKey(token));
+    if (token) await store.deleteSession(hashKey(token));
     reply.header("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
     return reply.code(204).send();
   });
 
-  app.get("/v1/me", { preHandler: requireSession }, async (req) => profile(sessionPlayer(req)!));
+  app.get("/v1/me", { preHandler: requireSession }, async (req) => profile((await sessionPlayer(req))!));
 
   app.post<{ Body: { cosmeticId: string } }>(
     "/v1/me/claims",
@@ -372,12 +448,12 @@ export function buildApp(opts: AppOptions): FastifyInstance {
       schema: { body: { type: "object", required: ["cosmeticId"], properties: { cosmeticId: { type: "string" } } } },
     },
     async (req, reply) => {
-      const uuid = sessionPlayer(req)!;
-      const cosmetic = store.getCosmetic(req.body.cosmeticId);
+      const uuid = (await sessionPlayer(req))!;
+      const cosmetic = await store.getCosmetic(req.body.cosmeticId);
       if (!cosmetic) return reply.code(404).send({ error: "unknown cosmetic" });
       if (!cosmetic.claimable) return reply.code(403).send({ error: "this cosmetic can't be claimed" });
-      store.grant(uuid, cosmetic.id);
-      publishPlayer(uuid);
+      await store.grant(uuid, cosmetic.id);
+      await publishPlayer(uuid);
       return profile(uuid);
     },
   );
@@ -388,18 +464,20 @@ export function buildApp(opts: AppOptions): FastifyInstance {
       preHandler: requireSession,
       schema: { body: { type: "object", required: ["cosmeticId"], properties: { cosmeticId: { type: "string" } } } },
     },
-    async (req, reply) => equip(sessionPlayer(req)!, req.params.slot, req.body.cosmeticId, reply),
+    async (req, reply) => equip((await sessionPlayer(req))!, req.params.slot, req.body.cosmeticId, reply),
   );
 
   app.delete<{ Params: { slot: string } }>("/v1/me/equipped/:slot", { preHandler: requireSession }, async (req) => {
-    const uuid = sessionPlayer(req)!;
-    store.unequip(uuid, req.params.slot);
-    publishPlayer(uuid);
-    return { uuid, equipped: store.equipped(uuid) };
+    const uuid = (await sessionPlayer(req))!;
+    await store.unequip(uuid, req.params.slot);
+    await publishPlayer(uuid);
+    return { uuid, equipped: await store.equipped(uuid) };
   });
 
   // Server-sent events: every change to any player or the catalog, as it happens, so a cosmetic
   // equipped on one server shows up on the others without the player rejoining.
+  // One API instance only for now: with several behind a load balancer, each server only hears
+  // changes made through the instance it's connected to (see events.ts).
   app.get("/v1/events", { preHandler: requireServer }, (req, reply) => {
     reply.hijack();
     const res = reply.raw;

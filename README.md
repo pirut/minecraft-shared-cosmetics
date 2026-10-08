@@ -9,7 +9,7 @@ Cosmetics that follow a player across every server that installs the plugin. A p
  │ Paper server │ ────────────▶ │  Central API (api/)  │
  │  + plugin    │ ◀──────────── │  catalog, ownership, │
  └──────────────┘   JSON/HTTPS  │  equipped slots      │
- ┌──────────────┐               │  (SQLite for now)    │
+ ┌──────────────┐               │  Postgres (or SQLite)│
  │ Paper server │ ────────────▶ └──────────────────────┘
  └──────────────┘
 ```
@@ -21,16 +21,30 @@ Cosmetics that follow a player across every server that installs the plugin. A p
 
 ## API (`api/`)
 
-Node 22.18+ (runs TypeScript directly), Fastify, built-in `node:sqlite`.
+Node 22.18+ (runs TypeScript directly), Fastify. Storage is Postgres when `DATABASE_URL` is set, otherwise a local SQLite file via built-in `node:sqlite`.
 
 ```sh
 cd api
 npm install
 ADMIN_TOKEN=change-me-to-something-long npm start   # listens on :8080, writes cosmetics.db
-npm test
+npm test                                            # SQLite only
+TEST_DATABASE_URL=postgres://user:pass@localhost/scratch npm test   # also Postgres (wipes that database)
 ```
 
-Optional settings: `PUBLIC_URL` (the address players open, e.g. `https://cosmetics.example.com`; used for the link in game and to mark the cookie `Secure`), `TRUST_PROXY=1` behind a reverse proxy, `DATABASE_PATH`, `HOST`, `PORT`.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ADMIN_TOKEN` | required | Admin secret, 16+ characters |
+| `DATABASE_URL` | unset | `postgres://…`; use this for hosting and for more than one instance |
+| `DATABASE_PATH` | `cosmetics.db` | SQLite file when `DATABASE_URL` is unset |
+| `PUBLIC_URL` | request host | Address players open, e.g. `https://cosmetics.example.com`; used for the link in game and to mark the cookie `Secure` |
+| `DATABASE_POOL_SIZE` | `10` | Postgres connections per instance |
+| `TRUST_PROXY` | off | Set `true` behind a load balancer so per-IP limits see the real client |
+| `RATE_LIMIT_SERVER_MAX` | `600` | Requests per window per server key |
+| `RATE_LIMIT_ANONYMOUS_MAX` | `60` | Requests per window per IP with no valid key |
+| `RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window |
+| `RATE_LIMIT_DISABLED` | off | Set `true` to turn limits off |
+| `PACK_DIR`, `PACK_URL` | `../resourcepack`, unset | Resource pack source and optional CDN URL (see below) |
+| `HOST`, `PORT` | `0.0.0.0`, `8080` | Listen address |
 
 Web pages:
 
@@ -44,7 +58,9 @@ Web pages:
 | GET | `/v1/pack/:sha1.zip` | none | The resource pack itself |
 | PUT | `/v1/cosmetics/:id` | admin | Create or update a cosmetic (`claimable: true` lets players claim it) |
 | POST | `/v1/servers` | admin | Register a server, returns its key once |
-| GET | `/v1/servers` | admin | List registered servers |
+| GET | `/v1/servers` | admin | List servers and whether they're revoked |
+| POST | `/v1/servers/:id/rotate` | admin | Issue a new key; old keys keep working for `graceSeconds` (default 86400, `0` = now) |
+| DELETE | `/v1/servers/:id` | admin | Revoke a server and every key it has, permanently |
 | GET | `/v1/admin/players/:uuidOrName` | admin | Look a player up by UUID or last reported name |
 | POST | `/v1/players/:uuid/grants` | admin | Give a player a cosmetic |
 | DELETE | `/v1/players/:uuid/grants/:id` | admin | Take a cosmetic away (and unequip it) |
@@ -62,6 +78,10 @@ Web pages:
 `/v1/events` streams a `player` event (`{uuid, owned, equipped}`) whenever a player's cosmetics change (grant, revoke, web claim, equip or unequip from a server or the web page), and a `catalog` event (`{id}`) when a cosmetic is created or updated, with a keep-alive comment every 25 seconds. The plugin uses it so a change on one server shows up on every other server straight away. Events fan out in-process, so this works with a single API instance; several instances would need a shared bus such as Postgres `LISTEN/NOTIFY`.
 
 Cosmetic types and their slots: `HAT` → `head`, `TRAIL` → `trail`.
+
+**Rate limits.** Each server key gets its own bucket, because many Minecraft hosts put dozens of servers behind one IP. Calls with no key or a wrong key share a per-IP bucket, which also slows down key guessing. The admin token and `/health` are never limited. Over the limit you get `429` with a `retry-after` header. Counters live in each instance's memory, so with N instances the effective limit is up to N times higher.
+
+**Rotating a key.** `POST /v1/servers/<id>/rotate` returns a new key. Give it to the server owner; their old key stops working after the grace period. If a key leaked, rotate with `{"graceSeconds":0}`. If a server is abusive, `DELETE /v1/servers/<id>` cuts it off for good.
 
 Quick start once the API is running:
 
@@ -108,6 +128,23 @@ If you'd rather players get a single download, set `resource-pack.enabled: false
 
 The pack is optional by default (`resource-pack.required: false`): players who decline it still see hats, as the plain fallback item. Download failures (unreachable URL, hash mismatch) are logged on the server.
 
+## Hosting on Fly.io
+
+`api/Dockerfile` builds the API image (with the resource pack baked in) and `fly.toml` deploys it, with a `/health` check and HTTPS forced. From the repo root:
+
+```sh
+fly launch --no-deploy --copy-config --name <your-app-name>   # creates the app from fly.toml
+fly postgres create --name <your-app-name>-db                 # or point DATABASE_URL at any Postgres
+fly postgres attach <your-app-name>-db                        # sets DATABASE_URL as a secret
+fly secrets set ADMIN_TOKEN=$(openssl rand -base64 32) PUBLIC_URL=https://<your-app-name>.fly.dev
+fly deploy
+fly scale count 1                                             # see the note below on instances
+```
+
+The schema is created on first boot. Run one machine for now: live sync (`/v1/events`) fans out within a single API process, so with several instances a server only hears changes made through the instance it's connected to. Then set `api-url` in each server's plugin config to `https://<your-app-name>.fly.dev`.
+
+Any other host that runs a Docker image works the same way (`docker build -f api/Dockerfile .` from the repo root): set `ADMIN_TOKEN`, `DATABASE_URL`, and `TRUST_PROXY=true` if it sits behind a proxy.
+
 ## Plugin (`plugin/`)
 
 Paper 1.21.4+, Java 21.
@@ -142,7 +179,7 @@ A trail with bad data logs one warning and is skipped.
 ## Not built yet
 
 - Paid cosmetics, gift or redeem codes, and achievement unlocks. Today players get cosmetics from an admin grant or by claiming free ones on the web page.
-- Rate limiting beyond wrong link codes (which is in memory, per instance), key revocation, and Postgres for multi-instance hosting.
+- Running more than one API instance: live sync needs a shared bus (Postgres LISTEN/NOTIFY), and rate limit counters (including wrong link codes) need a shared store (Redis). Schema migrations are create-if-missing only.
 - Uploading assets through the API. Today a new model means a commit to `resourcepack/` and an API restart.
 - Pre-1.20.3 clients (via ViaVersion) only hold one server pack, so for them the shared pack and the server's own pack replace each other.
 - The hat pose numbers are worked out from the vanilla player model and still need checking in game, elytra flight especially.

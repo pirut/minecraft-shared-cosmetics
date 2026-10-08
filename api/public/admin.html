@@ -104,7 +104,7 @@
       <h2>Servers</h2>
       <div class="scroll">
         <table>
-          <thead><tr><th>Name</th><th>ID</th><th>Registered</th></tr></thead>
+          <thead><tr><th>Name</th><th>ID</th><th>Registered</th><th>Status</th></tr></thead>
           <tbody id="servers"></tbody>
         </table>
       </div>
@@ -182,7 +182,8 @@ async function loadServers() {
   const { servers } = await api("GET", "/v1/servers");
   $("servers").replaceChildren(...servers.map((s) => {
     const tr = document.createElement("tr");
-    tr.append(cell(s.name), cell(s.id, "mono"), cell(new Date(s.createdAt).toLocaleString()));
+    const status = s.revokedAt ? "Revoked " + new Date(s.revokedAt).toLocaleDateString() : "Active";
+    tr.append(cell(s.name), cell(s.id, "mono"), cell(new Date(s.createdAt).toLocaleString()), cell(status));
     return tr;
   }));
 }
