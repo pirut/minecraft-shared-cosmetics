@@ -4,7 +4,8 @@ import com.google.gson.JsonObject;
 
 /**
  * A catalog entry from the shared API. {@code data} carries render hints:
- * HAT: {"material": "CARVED_PUMPKIN", "itemModel": "sharedcosmetics:top_hat"}
+ * HAT: {"material": "BLACK_WOOL", "kit": {"crown": "tall", "brim": "wide", "colors": ["#1c1c21"]}}
+ *      or {"material": "CARVED_PUMPKIN", "itemModel": "myns:custom_hat"} for a model outside the kit
  * TRAIL: {"particle": "HEART", "count": 1}
  */
 public record Cosmetic(String id, String name, String type, String slot, JsonObject data) {

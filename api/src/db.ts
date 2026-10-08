@@ -15,7 +15,8 @@ export interface Cosmetic {
   claimable: boolean;
   /**
    * Render hints for the server plugin.
-   * HAT:   { material: "CARVED_PUMPKIN", itemModel?: "sharedcosmetics:top_hat" }
+   * HAT:   { material: "BLACK_WOOL", kit?: { crown: "tall", brim: "wide", band: true, colors: ["#1c1c21", "#961a22"] } }
+   *        or { material: "CARVED_PUMPKIN", itemModel?: "myns:custom_hat" } for a model outside the kit
    * TRAIL: { particle: "HEART", count?: 1 }
    */
   data: Record<string, unknown>;

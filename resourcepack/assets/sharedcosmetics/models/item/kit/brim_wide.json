@@ -1,0 +1,6 @@
+{
+  "textures": {"particle":"sharedcosmetics:item/kit","kit":"sharedcosmetics:item/kit"},
+  "elements": [
+    {"from":[1,12,1],"to":[15,13,15],"faces":{"north":{"texture":"#kit","tintindex":0},"south":{"texture":"#kit","tintindex":0},"east":{"texture":"#kit","tintindex":0},"west":{"texture":"#kit","tintindex":0},"up":{"texture":"#kit","tintindex":0},"down":{"texture":"#kit","tintindex":0}}}
+  ]
+}

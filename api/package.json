@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/server.ts",
     "build-pack": "node --disable-warning=ExperimentalWarning scripts/build-pack.ts",
+    "gen-kit": "node --disable-warning=ExperimentalWarning scripts/gen-kit.ts",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },

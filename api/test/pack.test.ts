@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { buildApp } from "../src/app.ts";
 import { SqliteStore } from "../src/sqlite-store.ts";
+import { KIT_PARTS } from "../src/kit.ts";
 import { buildPack } from "../src/pack.ts";
 
 const ADMIN = "test-admin-token-123456";
@@ -25,16 +26,29 @@ function zipEntries(zip: Buffer): string[] {
   return names;
 }
 
-test("the repo pack builds reproducibly and contains the top hat", () => {
+test("the repo pack builds reproducibly and contains the hat kit", () => {
   const a = buildPack();
   const b = buildPack();
   assert.equal(a.sha1, b.sha1);
   assert.equal(a.sha1, createHash("sha1").update(a.zip).digest("hex"));
   const names = zipEntries(a.zip);
   assert.ok(names.includes("pack.mcmeta"));
-  assert.ok(names.includes("assets/sharedcosmetics/items/top_hat.json"));
-  assert.ok(names.includes("assets/sharedcosmetics/models/item/top_hat.json"));
-  assert.ok(names.includes("assets/sharedcosmetics/textures/item/top_hat.png"));
+  assert.ok(names.includes("assets/sharedcosmetics/items/kit.json"));
+  assert.ok(names.includes("assets/sharedcosmetics/textures/item/kit.png"));
+});
+
+test("every kit option has a model, and the kit model only references models in the pack", () => {
+  const names = new Set(zipEntries(buildPack().zip));
+  const modelFile = (ref: string) => `assets/${ref.replace(":", "/models/")}.json`;
+  for (const [slot, options] of Object.entries(KIT_PARTS)) {
+    for (const option of options) {
+      assert.ok(names.has(modelFile(`sharedcosmetics:item/kit/${slot}_${option}`)), `${slot} ${option}`);
+    }
+  }
+  const kit = readFileSync(new URL("../../resourcepack/assets/sharedcosmetics/items/kit.json", import.meta.url), "utf8");
+  for (const [, ref] of kit.matchAll(/"model": "([^"]+)"/g)) {
+    assert.ok(names.has(modelFile(ref)), ref);
+  }
 });
 
 test("pack build rejects broken JSON and folders without pack.mcmeta", () => {
@@ -72,4 +86,22 @@ test("pack info points at an external host when one is configured", async () => 
 test("pack endpoints 404 when no pack is configured", async () => {
   const app = await buildApp({ store: new SqliteStore(":memory:"), adminToken: ADMIN });
   assert.equal((await app.inject({ method: "GET", url: "/v1/pack" })).statusCode, 404);
+});
+
+test("hat kits are validated when a cosmetic is saved", async () => {
+  const app = await buildApp({ store: new SqliteStore(":memory:"), adminToken: ADMIN });
+  const put = (kit: unknown) =>
+    app.inject({
+      method: "PUT",
+      url: "/v1/cosmetics/wizard_hat",
+      headers: { authorization: `Bearer ${ADMIN}` },
+      payload: { name: "Wizard Hat", type: "HAT", data: { material: "PURPLE_WOOL", kit } },
+    });
+  const ok = await put({ crown: "cone", brim: "wide", extra: "none", band: true, colors: ["#3b1f6b", "#e8c547"] });
+  assert.equal(ok.statusCode, 200);
+  assert.equal(ok.json().data.kit.crown, "cone");
+  assert.equal((await put({ crown: "sombrero" })).statusCode, 400);
+  assert.equal((await put({ colors: ["purple"] })).statusCode, 400);
+  // Unknown keys are dropped rather than stored.
+  assert.deepEqual((await put({ crown: "tall", size: 3 })).json().data.kit, { crown: "tall" });
 });

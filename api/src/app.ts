@@ -2,6 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import rateLimit from "@fastify/rate-limit";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
+import { KIT_SCHEMA } from "./kit.ts";
 import { SLOT_FOR_TYPE, type CosmeticType, type Store } from "./db.ts";
 import type { ResourcePack } from "./pack.ts";
 import { ChangeFeed } from "./events.ts";
@@ -233,7 +234,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
             name: { type: "string", minLength: 1, maxLength: 64 },
             type: { type: "string", enum: Object.keys(SLOT_FOR_TYPE) },
             claimable: { type: "boolean" },
-            data: { type: "object" },
+            data: { type: "object", properties: { kit: KIT_SCHEMA } },
           },
         },
       },
