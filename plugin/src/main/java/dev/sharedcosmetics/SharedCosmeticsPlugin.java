@@ -13,7 +13,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.event.ClickEvent;
+import net.kyori.adventure.text.event.HoverEvent;
 import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
@@ -161,7 +164,7 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
     private void loadPlayer(Player player) {
         if (!hasMojangUuid(player)) return;
         UUID uuid = player.getUniqueId();
-        api.fetchPlayer(uuid).whenComplete((profile, error) -> {
+        api.fetchPlayer(uuid, player.getName()).whenComplete((profile, error) -> {
             if (error != null) {
                 getLogger().warning("Could not load cosmetics for " + player.getName() + ": " + error.getMessage());
                 return;
@@ -197,7 +200,7 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
         }
         String sub = args.length == 0 ? "list" : args[0].toLowerCase();
         switch (sub) {
-            case "list" -> api.fetchPlayer(player.getUniqueId()).whenComplete((profile, error) -> {
+            case "list" -> api.fetchPlayer(player.getUniqueId(), player.getName()).whenComplete((profile, error) -> {
                 if (error != null) {
                     fail(player, error);
                     return;
@@ -223,6 +226,19 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
                 }
                 updateEquipped(player, api.equip(player.getUniqueId(), cosmetic.slot(), cosmetic.id()), "Equipped " + cosmetic.name() + ".");
             }
+            case "link" -> api.createLinkCode(player.getUniqueId(), player.getName()).whenComplete((link, error) -> {
+                if (error != null) {
+                    fail(player, error);
+                    return;
+                }
+                player.sendMessage(Component.text("Your link code is ", NamedTextColor.GOLD)
+                        .append(Component.text(link.code(), NamedTextColor.WHITE))
+                        .append(Component.text(". It works once and expires in 10 minutes.", NamedTextColor.GOLD)));
+                player.sendMessage(Component.text("Click here to open the cosmetics page", NamedTextColor.AQUA)
+                        .decorate(TextDecoration.UNDERLINED)
+                        .clickEvent(ClickEvent.openUrl(link.url()))
+                        .hoverEvent(HoverEvent.showText(Component.text(link.url()))));
+            });
             case "unequip" -> {
                 if (args.length < 2) return false;
                 updateEquipped(player, api.unequip(player.getUniqueId(), args[1]), "Unequipped your " + args[1] + " cosmetic.");
@@ -250,7 +266,7 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String label, String[] args) {
-        if (args.length == 1) return filter(List.of("list", "equip", "unequip"), args[0]);
+        if (args.length == 1) return filter(List.of("list", "equip", "unequip", "link"), args[0]);
         if (args.length == 2 && args[0].equalsIgnoreCase("equip") && sender instanceof Player player) {
             return filter(List.copyOf(owned.getOrDefault(player.getUniqueId(), Set.of())), args[1]);
         }

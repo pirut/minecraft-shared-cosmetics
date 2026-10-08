@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared Cosmetics</title>
+<style>
+  :root { --bg: #f6f5f2; --card: #fff; --text: #1d1d1b; --muted: #6b6a66; --line: #e2e0da; --accent: #3a7d44; --err: #b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --card: #22221f; --text: #ecebe6; --muted: #a09e97; --line: #3a3934; --accent: #6cbf77; --err: #f2b8b5; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 32px 16px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  h2 { font-size: 1.1rem; margin: 28px 0 8px; }
+  p { margin: 0 0 12px; color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 20px; margin-top: 20px; }
+  code { background: var(--line); padding: 1px 6px; border-radius: 4px; }
+  input { font: inherit; font-family: ui-monospace, monospace; letter-spacing: 2px; text-transform: uppercase; padding: 10px 12px;
+          border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); width: 12ch; }
+  button { font: inherit; padding: 10px 16px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+  li:first-child { border-top: 0; }
+  .meta { color: var(--muted); font-size: .9rem; }
+  .on { color: var(--accent); font-weight: 600; }
+  .error { color: var(--err); min-height: 1.5em; margin-top: 8px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Shared Cosmetics</h1>
+  <p>Cosmetics that follow you to every server running the Shared Cosmetics plugin.</p>
+
+  <section id="link" class="card" hidden>
+    <h2 style="margin-top:0">Link your Minecraft account</h2>
+    <p>Join any participating server and run <code>/cosmetics link</code>. Enter the code it gives you here. Codes last 10 minutes.</p>
+    <form id="link-form" class="row">
+      <input id="code" autocomplete="off" maxlength="9" placeholder="ABCD-EFGH" aria-label="Link code" required>
+      <button type="submit">Link</button>
+    </form>
+    <div id="link-error" class="error" role="alert"></div>
+  </section>
+
+  <section id="account" hidden>
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <div>
+          <strong id="player-name"></strong>
+          <div class="meta" id="player-uuid"></div>
+        </div>
+        <button class="ghost" id="logout">Sign out</button>
+      </div>
+    </div>
+
+    <h2>Your cosmetics</h2>
+    <div class="card"><ul id="owned"></ul></div>
+
+    <div id="claim-section" hidden>
+      <h2>Free to claim</h2>
+      <div class="card"><ul id="claimable"></ul></div>
+    </div>
+    <div id="account-error" class="error" role="alert"></div>
+    <p class="meta">Changes reach servers right away, or at your next join on servers with live sync turned off.</p>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+    credentials: "same-origin",
+  });
+  const data = res.status === 204 ? null : await res.json().catch(() => null);
+  if (!res.ok) throw Object.assign(new Error((data && data.error) || "HTTP " + res.status), { status: res.status });
+  return data;
+}
+
+function item(cosmetic, detail, action) {
+  const li = document.createElement("li");
+  const left = document.createElement("div");
+  const name = document.createElement("div");
+  name.textContent = cosmetic.name;
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = detail;
+  left.append(name, meta);
+  li.append(left);
+  if (action) li.append(action);
+  return li;
+}
+
+function button(label, onClick, ghost) {
+  const b = document.createElement("button");
+  b.textContent = label;
+  if (ghost) b.className = "ghost";
+  b.onclick = async () => {
+    b.disabled = true;
+    $("account-error").textContent = "";
+    try { await onClick(); } catch (e) { $("account-error").textContent = e.message; b.disabled = false; }
+  };
+  return b;
+}
+
+async function render(profile) {
+  const { cosmetics } = await api("GET", "/v1/cosmetics");
+  $("link").hidden = true;
+  $("account").hidden = false;
+  $("player-name").textContent = profile.name || "Linked player";
+  $("player-uuid").textContent = profile.uuid;
+
+  const owned = $("owned");
+  owned.replaceChildren();
+  if (profile.owned.length === 0) {
+    const li = document.createElement("li");
+    li.className = "meta";
+    li.textContent = "You don't own any cosmetics yet.";
+    owned.append(li);
+  }
+  for (const c of profile.owned) {
+    const on = profile.equipped[c.slot] === c.id;
+    const li = item(c, on ? "Equipped, " + c.slot : c.slot,
+      on ? button("Unequip", () => api("DELETE", "/v1/me/equipped/" + c.slot).then(refresh), true)
+         : button("Equip", () => api("PUT", "/v1/me/equipped/" + c.slot, { cosmeticId: c.id }).then(refresh)));
+    if (on) li.firstChild.firstChild.className = "on";
+    owned.append(li);
+  }
+
+  const ownedIds = new Set(profile.owned.map((c) => c.id));
+  const free = cosmetics.filter((c) => c.claimable && !ownedIds.has(c.id));
+  $("claim-section").hidden = free.length === 0;
+  $("claimable").replaceChildren(...free.map((c) =>
+    item(c, c.slot, button("Claim", () => api("POST", "/v1/me/claims", { cosmeticId: c.id }).then(render)))));
+}
+
+async function refresh() {
+  try {
+    await render(await api("GET", "/v1/me"));
+  } catch (e) {
+    if (e.status !== 401) $("link-error").textContent = e.message;
+    $("account").hidden = true;
+    $("link").hidden = false;
+  }
+}
+
+$("link-form").onsubmit = async (event) => {
+  event.preventDefault();
+  $("link-error").textContent = "";
+  try {
+    await render(await api("POST", "/v1/session", { code: $("code").value }));
+    history.replaceState(null, "", location.pathname);
+  } catch (e) {
+    $("link-error").textContent = e.message;
+  }
+};
+
+$("logout").onclick = async () => {
+  await api("DELETE", "/v1/session").catch(() => {});
+  $("code").value = "";
+  refresh();
+};
+
+// The in-game link pre-fills the code; the player still presses Link so a shared URL can't sign them in silently.
+const prefill = new URLSearchParams(location.search).get("code");
+if (prefill) $("code").value = prefill;
+refresh();
+</script>
+</body>
+</html>
