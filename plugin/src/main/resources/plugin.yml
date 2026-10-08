@@ -5,8 +5,8 @@ api-version: '1.21'
 description: Cosmetics that follow players across every participating server.
 commands:
   cosmetics:
-    description: List, equip and unequip your shared cosmetics.
-    usage: /cosmetics [list|equip <id>|unequip <slot>]
+    description: List, equip and unequip your shared cosmetics, or link your account on the web.
+    usage: /cosmetics [list|equip <id>|unequip <slot>|link]
     permission: sharedcosmetics.use
 permissions:
   sharedcosmetics.use:
