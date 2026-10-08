@@ -13,7 +13,15 @@ const packDir = process.env.PACK_DIR ?? DEFAULT_PACK_DIR;
 const pack = existsSync(packDir) ? buildPack(packDir) : undefined;
 
 const store = new Store(process.env.DATABASE_PATH ?? "cosmetics.db");
-const app = buildApp({ store, adminToken, logger: true, pack, packUrl: process.env.PACK_URL || undefined });
+const app = buildApp({
+  store,
+  adminToken,
+  publicUrl: process.env.PUBLIC_URL,
+  trustProxy: process.env.TRUST_PROXY === "1",
+  logger: true,
+  pack,
+  packUrl: process.env.PACK_URL || undefined,
+});
 if (pack) app.log.info({ sha1: pack.sha1, bytes: pack.zip.length }, `resource pack built from ${packDir}`);
 else app.log.warn(`no resource pack at ${packDir}; custom hat models won't load`);
 
