@@ -1,5 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
+import { KIT_SCHEMA } from "./kit.ts";
 import { SLOT_FOR_TYPE, Store, type CosmeticType } from "./db.ts";
 import type { ResourcePack } from "./pack.ts";
 import { ChangeFeed } from "./events.ts";
@@ -115,7 +116,7 @@ export function buildApp(opts: AppOptions): FastifyInstance {
           properties: {
             name: { type: "string", minLength: 1, maxLength: 64 },
             type: { type: "string", enum: Object.keys(SLOT_FOR_TYPE) },
-            data: { type: "object" },
+            data: { type: "object", properties: { kit: KIT_SCHEMA } },
           },
         },
       },

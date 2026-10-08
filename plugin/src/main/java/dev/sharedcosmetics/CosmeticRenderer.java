@@ -124,7 +124,10 @@ public final class CosmeticRenderer {
         Material material = Material.matchMaterial(cosmetic.dataString("material", "CARVED_PUMPKIN"));
         ItemStack item = new ItemStack(material != null && material.isItem() ? material : Material.CARVED_PUMPKIN);
         String itemModel = cosmetic.dataString("itemModel", null);
-        if (itemModel != null) {
+        if (cosmetic.data().has("kit") && cosmetic.data().get("kit").isJsonObject()) {
+            // Built from the pack's parts kit; also falls back to the material without the pack.
+            HatKit.apply(item, cosmetic.data().getAsJsonObject("kit"));
+        } else if (itemModel != null) {
             // Points at a model in the shared resource pack; falls back to the material without it.
             NamespacedKey key = NamespacedKey.fromString(itemModel);
             if (key != null) item.editMeta(meta -> meta.setItemModel(key));

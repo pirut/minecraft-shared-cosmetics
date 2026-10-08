@@ -1,0 +1,7 @@
+{
+  "textures": {"particle":"sharedcosmetics:item/kit","kit":"sharedcosmetics:item/kit"},
+  "elements": [
+    {"from":[4,12,7],"to":[6,15,9],"faces":{"north":{"texture":"#kit","tintindex":0},"south":{"texture":"#kit","tintindex":0},"east":{"texture":"#kit","tintindex":0},"west":{"texture":"#kit","tintindex":0},"up":{"texture":"#kit","tintindex":0},"down":{"texture":"#kit","tintindex":0}}},
+    {"from":[10,12,7],"to":[12,15,9],"faces":{"north":{"texture":"#kit","tintindex":0},"south":{"texture":"#kit","tintindex":0},"east":{"texture":"#kit","tintindex":0},"west":{"texture":"#kit","tintindex":0},"up":{"texture":"#kit","tintindex":0},"down":{"texture":"#kit","tintindex":0}}}
+  ]
+}

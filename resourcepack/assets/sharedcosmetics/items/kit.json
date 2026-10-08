@@ -1,0 +1,182 @@
+{
+  "model": {
+    "type": "minecraft:composite",
+    "models": [
+      {
+        "type": "minecraft:select",
+        "property": "minecraft:custom_model_data",
+        "index": 0,
+        "cases": [
+          {
+            "when": "tall",
+            "model": {
+              "type": "minecraft:model",
+              "model": "sharedcosmetics:item/kit/crown_tall",
+              "tints": [
+                {
+                  "type": "minecraft:custom_model_data",
+                  "index": 0,
+                  "default": 16777215
+                }
+              ]
+            }
+          },
+          {
+            "when": "short",
+            "model": {
+              "type": "minecraft:model",
+              "model": "sharedcosmetics:item/kit/crown_short",
+              "tints": [
+                {
+                  "type": "minecraft:custom_model_data",
+                  "index": 0,
+                  "default": 16777215
+                }
+              ]
+            }
+          },
+          {
+            "when": "cone",
+            "model": {
+              "type": "minecraft:model",
+              "model": "sharedcosmetics:item/kit/crown_cone",
+              "tints": [
+                {
+                  "type": "minecraft:custom_model_data",
+                  "index": 0,
+                  "default": 16777215
+                }
+              ]
+            }
+          },
+          {
+            "when": "dome",
+            "model": {
+              "type": "minecraft:model",
+              "model": "sharedcosmetics:item/kit/crown_dome",
+              "tints": [
+                {
+                  "type": "minecraft:custom_model_data",
+                  "index": 0,
+                  "default": 16777215
+                }
+              ]
+            }
+          }
+        ],
+        "fallback": {
+          "type": "minecraft:empty"
+        }
+      },
+      {
+        "type": "minecraft:select",
+        "property": "minecraft:custom_model_data",
+        "index": 1,
+        "cases": [
+          {
+            "when": "wide",
+            "model": {
+              "type": "minecraft:model",
+              "model": "sharedcosmetics:item/kit/brim_wide",
+              "tints": [
+                {
+                  "type": "minecraft:custom_model_data",
+                  "index": 2,
+                  "default": 16777215
+                }
+              ]
+            }
+          },
+          {
+            "when": "narrow",
+            "model": {
+              "type": "minecraft:model",
+              "model": "sharedcosmetics:item/kit/brim_narrow",
+              "tints": [
+                {
+                  "type": "minecraft:custom_model_data",
+                  "index": 2,
+                  "default": 16777215
+                }
+              ]
+            }
+          }
+        ],
+        "fallback": {
+          "type": "minecraft:empty"
+        }
+      },
+      {
+        "type": "minecraft:select",
+        "property": "minecraft:custom_model_data",
+        "index": 2,
+        "cases": [
+          {
+            "when": "ears",
+            "model": {
+              "type": "minecraft:model",
+              "model": "sharedcosmetics:item/kit/extra_ears",
+              "tints": [
+                {
+                  "type": "minecraft:custom_model_data",
+                  "index": 1,
+                  "default": 16777215
+                }
+              ]
+            }
+          },
+          {
+            "when": "horns",
+            "model": {
+              "type": "minecraft:model",
+              "model": "sharedcosmetics:item/kit/extra_horns",
+              "tints": [
+                {
+                  "type": "minecraft:custom_model_data",
+                  "index": 1,
+                  "default": 16777215
+                }
+              ]
+            }
+          },
+          {
+            "when": "halo",
+            "model": {
+              "type": "minecraft:model",
+              "model": "sharedcosmetics:item/kit/extra_halo",
+              "tints": [
+                {
+                  "type": "minecraft:custom_model_data",
+                  "index": 1,
+                  "default": 16777215
+                }
+              ]
+            }
+          }
+        ],
+        "fallback": {
+          "type": "minecraft:empty"
+        }
+      },
+      {
+        "type": "minecraft:condition",
+        "property": "minecraft:custom_model_data",
+        "index": 0,
+        "on_true": {
+          "type": "minecraft:model",
+          "model": "sharedcosmetics:item/kit/band",
+          "tints": [
+            {
+              "type": "minecraft:custom_model_data",
+              "index": 1,
+              "default": 16777215
+            }
+          ]
+        },
+        "on_false": {
+          "type": "minecraft:empty"
+        }
+      }
+    ]
+  }
+}
