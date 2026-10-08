@@ -1,22 +1,22 @@
 package dev.sharedcosmetics;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
-import org.bukkit.Particle;
 import org.bukkit.entity.ItemDisplay;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.util.Transformation;
-import org.joml.AxisAngle4f;
-import org.joml.Vector3f;
 
 /**
  * Draws equipped cosmetics using only vanilla client features, so players need no mod:
@@ -28,24 +28,32 @@ public final class CosmeticRenderer {
     private static final class State {
         Map<String, String> equipped = Map.of();
         ItemDisplay hat;
+        Cosmetic hatCosmetic;
+        Transformation hatTransform;
         Location lastTrailAt;
     }
 
     private final Plugin plugin;
     private final Function<String, Cosmetic> catalog;
-    private final float hatOffsetY;
+    private final HatPlacement placement;
+    private final int tickInterval;
     private final Map<UUID, State> states = new HashMap<>();
+    /** Parsed trail particles by cosmetic id; empty when the cosmetic's data is invalid. */
+    private final Map<String, Optional<TrailEffect>> trails = new HashMap<>();
+    private final Set<String> warnedTrails = new HashSet<>();
 
-    public CosmeticRenderer(Plugin plugin, Function<String, Cosmetic> catalog, float hatOffsetY) {
+    public CosmeticRenderer(Plugin plugin, Function<String, Cosmetic> catalog, HatPlacement placement, int tickInterval) {
         this.plugin = plugin;
         this.catalog = catalog;
-        this.hatOffsetY = hatOffsetY;
+        this.placement = placement;
+        this.tickInterval = tickInterval;
     }
 
+    /** Shows the given equipped cosmetics. A no-op when nothing changed, so repeated syncs don't flicker. */
     public void apply(Player player, Map<String, String> equipped) {
         State state = states.computeIfAbsent(player.getUniqueId(), id -> new State());
+        if (state.equipped.equals(equipped)) return;
         state.equipped = Map.copyOf(equipped);
-        removeHat(state);
         refreshHat(player, state);
     }
 
@@ -59,11 +67,13 @@ public final class CosmeticRenderer {
         states.clear();
     }
 
-    /** Re-draws everything, e.g. after the catalog changed. */
-    public void reapplyAll() {
+    /** Re-draws after the catalog changed: hats whose cosmetic changed are respawned, trails re-parsed. */
+    public void catalogChanged() {
+        trails.clear();
+        warnedTrails.clear();
         for (Player player : plugin.getServer().getOnlinePlayers()) {
             State state = states.get(player.getUniqueId());
-            if (state != null) apply(player, state.equipped);
+            if (state != null) refreshHat(player, state);
         }
     }
 
@@ -85,21 +95,32 @@ public final class CosmeticRenderer {
 
     private void refreshHat(Player player, State state) {
         Cosmetic cosmetic = equippedCosmetic(state, "head");
-        if (cosmetic == null || !visible(player)) {
+        Transformation transform = cosmetic == null || !visible(player) ? null : placement.forPose(player);
+        if (transform == null) {
             removeHat(state);
             return;
         }
         // Teleports, world changes and death all dismount passengers; respawn the hat when that happens.
-        if (state.hat != null && (!state.hat.isValid() || !player.getPassengers().contains(state.hat))) {
+        // A different cosmetic (or an updated catalog entry) also needs a fresh item.
+        if (state.hat != null
+                && (!state.hat.isValid() || !player.getPassengers().contains(state.hat) || !cosmetic.equals(state.hatCosmetic))) {
             removeHat(state);
         }
         if (state.hat == null) {
-            state.hat = spawnHat(player, cosmetic);
+            state.hat = spawnHat(player, cosmetic, transform);
+            state.hatCosmetic = cosmetic;
+            state.hatTransform = transform;
+        } else if (!transform.equals(state.hatTransform)) {
+            // Glide to the new pose instead of snapping, over the time until the next update.
+            state.hat.setInterpolationDelay(0);
+            state.hat.setInterpolationDuration(tickInterval);
+            state.hat.setTransformation(transform);
+            state.hatTransform = transform;
         }
         state.hat.setRotation(player.getLocation().getYaw(), 0);
     }
 
-    private ItemDisplay spawnHat(Player player, Cosmetic cosmetic) {
+    private ItemDisplay spawnHat(Player player, Cosmetic cosmetic, Transformation transform) {
         Material material = Material.matchMaterial(cosmetic.dataString("material", "CARVED_PUMPKIN"));
         ItemStack item = new ItemStack(material != null && material.isItem() ? material : Material.CARVED_PUMPKIN);
         String itemModel = cosmetic.dataString("itemModel", null);
@@ -112,8 +133,9 @@ public final class CosmeticRenderer {
             d.setPersistent(false);
             d.setItemStack(item);
             d.setItemDisplayTransform(ItemDisplay.ItemDisplayTransform.HEAD);
-            d.setTransformation(new Transformation(
-                    new Vector3f(0, hatOffsetY, 0), new AxisAngle4f(), new Vector3f(1, 1, 1), new AxisAngle4f()));
+            d.setTransformation(transform);
+            // Smooths the yaw updates sent every tick interval.
+            d.setTeleportDuration(Math.min(tickInterval, 59));
         });
         player.addPassenger(display);
         // The wearer would otherwise see the hat floating in front of their camera.
@@ -125,6 +147,8 @@ public final class CosmeticRenderer {
         if (state.hat != null) {
             state.hat.remove();
             state.hat = null;
+            state.hatCosmetic = null;
+            state.hatTransform = null;
         }
     }
 
@@ -137,15 +161,18 @@ public final class CosmeticRenderer {
         // Only while moving, so idle players don't sit in a particle cloud.
         if (last == null || last.getWorld() != now.getWorld() || last.distanceSquared(now) < 0.01) return;
 
-        Particle particle;
-        try {
-            particle = Particle.valueOf(cosmetic.dataString("particle", "HEART"));
-        } catch (IllegalArgumentException e) {
-            return;
-        }
-        // Particles that need extra data (dust colors, block states) aren't supported yet.
-        if (particle.getDataType() != Void.class) return;
-        now.getWorld().spawnParticle(particle, now.add(0, 0.1, 0), cosmetic.dataInt("count", 1), 0.2, 0.05, 0.2, 0);
+        trail(cosmetic).ifPresent(effect -> effect.spawn(now.add(0, 0.1, 0)));
+    }
+
+    private Optional<TrailEffect> trail(Cosmetic cosmetic) {
+        return trails.computeIfAbsent(cosmetic.id(), id -> {
+            try {
+                return Optional.of(TrailEffect.parse(cosmetic));
+            } catch (RuntimeException e) {
+                if (warnedTrails.add(id)) plugin.getLogger().warning("Trail " + id + " can't be shown: " + e.getMessage());
+                return Optional.empty();
+            }
+        });
     }
 
     private Cosmetic equippedCosmetic(State state, String slot) {

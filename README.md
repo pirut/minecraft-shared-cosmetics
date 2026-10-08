@@ -17,7 +17,7 @@ Cosmetics that follow a player across every server that installs the plugin. A p
 - **Identity** is the player's Mojang UUID. Servers must run in `online-mode=true` (or behind a properly configured Velocity/BungeeCord proxy), otherwise anyone can claim any UUID.
 - **Servers** authenticate with a per-server API key. They can read a player's cosmetics and equip or unequip ones the player already owns. Only the admin token can create cosmetics or grant them, so a rogue server can't hand out items.
 - **Players** reach the web page by running `/cosmetics link` in game. The server asks the API for a one-time code (8 characters, 10 minutes) and the player types it on the page, which signs them in with a 30-day cookie tied to their UUID. No Microsoft login is involved: holding the code proves you were online as that player a moment ago. On the page they can equip what they own and claim any cosmetic an admin marked as claimable.
-- **Rendering** uses vanilla client features only. Hats are `ItemDisplay` entities riding the player (hidden from the wearer so they don't block the camera). Trails are particles. Custom 3D hat models need a server resource pack; a hat's `itemModel` points at a model in that pack and falls back to its plain `material` without it.
+- **Rendering** uses vanilla client features only. Hats are `ItemDisplay` entities riding the player (hidden from the wearer so they don't block the camera). Trails are particles. Custom 3D hat models come from the shared resource pack (`resourcepack/`), which the plugin sends to players on join; a hat's `itemModel` points at a model in that pack and falls back to its plain `material` for anyone without it.
 
 ## API (`api/`)
 
@@ -40,6 +40,8 @@ Web pages:
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | GET | `/v1/cosmetics` | none | Full catalog with render hints |
+| GET | `/v1/pack` | none | Resource pack SHA-1 and download path (or CDN `url`) |
+| GET | `/v1/pack/:sha1.zip` | none | The resource pack itself |
 | PUT | `/v1/cosmetics/:id` | admin | Create or update a cosmetic (`claimable: true` lets players claim it) |
 | POST | `/v1/servers` | admin | Register a server, returns its key once |
 | GET | `/v1/servers` | admin | List registered servers |
@@ -55,6 +57,9 @@ Web pages:
 | GET | `/v1/me` | cookie | The signed-in player's cosmetics |
 | POST | `/v1/me/claims` | cookie | Claim a claimable cosmetic |
 | PUT / DELETE | `/v1/me/equipped/:slot` | cookie | Equip or unequip from the web |
+| GET | `/v1/events` | server | Server-sent event stream of changes (see below) |
+
+`/v1/events` streams a `player` event (`{uuid, owned, equipped}`) whenever a player's cosmetics change (grant, revoke, web claim, equip or unequip from a server or the web page), and a `catalog` event (`{id}`) when a cosmetic is created or updated, with a keep-alive comment every 25 seconds. The plugin uses it so a change on one server shows up on every other server straight away. Events fan out in-process, so this works with a single API instance; several instances would need a shared bus such as Postgres `LISTEN/NOTIFY`.
 
 Cosmetic types and their slots: `HAT` → `head`, `TRAIL` → `trail`.
 
@@ -64,12 +69,34 @@ Quick start once the API is running:
 A="Authorization: Bearer change-me-to-something-long"
 curl -X PUT localhost:8080/v1/cosmetics/pumpkin_hat -H "$A" -H 'Content-Type: application/json' \
   -d '{"name":"Pumpkin Hat","type":"HAT","data":{"material":"CARVED_PUMPKIN"}}'
+curl -X PUT localhost:8080/v1/cosmetics/top_hat -H "$A" -H 'Content-Type: application/json' \
+  -d '{"name":"Top Hat","type":"HAT","data":{"material":"BLACK_WOOL","itemModel":"sharedcosmetics:top_hat"}}'
 curl -X PUT localhost:8080/v1/cosmetics/hearts -H "$A" -H 'Content-Type: application/json' \
   -d '{"name":"Heart Trail","type":"TRAIL","data":{"particle":"HEART"}}'
+curl -X PUT localhost:8080/v1/cosmetics/ember_dust -H "$A" -H 'Content-Type: application/json' \
+  -d '{"name":"Ember Dust","type":"TRAIL","data":{"particle":"DUST_COLOR_TRANSITION","color":"#ff5500","toColor":"#330000","size":1.5,"count":3}}'
 curl -X POST localhost:8080/v1/servers -H "$A" -H 'Content-Type: application/json' -d '{"name":"my-server"}'
 curl -X POST localhost:8080/v1/players/<uuid>/grants -H "$A" -H 'Content-Type: application/json' \
   -d '{"cosmeticId":"pumpkin_hat"}'
 ```
+
+## Resource pack (`resourcepack/`)
+
+Every custom model lives in one shared pack under the `sharedcosmetics` namespace. To add a hat:
+
+1. Add `assets/sharedcosmetics/items/<name>.json`, its model under `models/item/` and texture under `textures/item/` (see `top_hat`).
+2. Create the cosmetic with `"itemModel": "sharedcosmetics:<name>"` and a fallback `material`.
+3. Restart the API. It zips the folder at startup and serves it at `/v1/pack/<sha1>.zip`.
+
+Servers pick up the new hash within five minutes and push it to everyone online; the client only re-downloads when the hash changes. The zip is reproducible (stored entries, sorted, fixed timestamps), so the same assets give the same SHA-1 anywhere.
+
+**Hosting.** By default the API serves the pack itself. To put it on a CDN or static host instead, run `npm run build-pack` in `api/`, upload `dist/sharedcosmetics-<sha1>.zip`, and start the API with `PACK_URL` set to its public URL. The API still builds the pack from the same folder to know the hash, so deploy the API and the upload from the same commit. `PACK_DIR` points the API at a different folder.
+
+**Servers that already send a resource pack.** Minecraft 1.20.3+ clients hold several server packs at once, keyed by id. The plugin sends the shared pack under its own fixed id with `replace: false`, so it lands next to the pack from `server.properties` or another plugin instead of replacing it, and both stay loaded. Nothing collides because every shared file is under `assets/sharedcosmetics/`. The admin doesn't need to do anything.
+
+If you'd rather players get a single download, set `resource-pack.enabled: false` in the plugin config and copy `resourcepack/assets/sharedcosmetics/` into your own pack. You then need to re-merge when the shared pack changes, or new hats show as their fallback item.
+
+The pack is optional by default (`resource-pack.required: false`): players who decline it still see hats, as the plain fallback item. Download failures (unreachable URL, hash mismatch) are logged on the server.
 
 ## Plugin (`plugin/`)
 
@@ -82,10 +109,30 @@ cd plugin
 
 Drop the jar in `plugins/`, start once, then set `api-url` and `server-key` in `plugins/SharedCosmetics/config.yml`. In game: `/cosmetics list`, `/cosmetics equip <id>`, `/cosmetics unequip <head|trail>`, `/cosmetics link`.
 
+**Live sync.** With `live-sync: true` (the default) the plugin keeps the `/v1/events` stream open, so equipping a hat on server A puts it on the player's head on server B (and in front of everyone there) right away. If the connection drops it reconnects with backoff and re-fetches every online player, so nothing missed while it was down is lost.
+
+**Velocity and BungeeCord.** Install the plugin on every backend server, not on the proxy; backends on one network can share a server key. Cosmetics are keyed by Mojang account UUIDs, so the plugin only serves players whose UUID is a real Mojang one (version 4). That means it works on online-mode servers and behind an online-mode proxy with forwarding (Velocity modern forwarding, or BungeeCord with `settings.bungeecord: true`), and it stays off for offline-mode players and Bedrock players from Floodgate rather than letting them read or change someone else's cosmetics. The plugin logs at startup if the setup means players will be skipped. With BungeeCord forwarding, firewall the backends so only the proxy can reach them, or anyone can spoof a UUID.
+
+**Hats** follow the player's pose: they tilt with the head, drop when sneaking, and move to the front of the body when swimming, crawling or flying with an elytra. They hide while sleeping and during riptide spins, and keep working while riding. The numbers come from the vanilla player model and can be tuned under `hat:` in `config.yml`.
+
+**Trails** can use any particle, including ones that need extra data. Keys in the cosmetic's `data`:
+
+| Key | Used by | Example |
+| --- | --- | --- |
+| `particle` | all | `"HEART"`, `"DUST"` |
+| `count` | all (1 to 20, default 1) | `3` |
+| `color`, `toColor` | `DUST`, `DUST_COLOR_TRANSITION`, `ENTITY_EFFECT` | `"#ff5500"` |
+| `size` | dust (0.01 to 4, default 1) | `1.5` |
+| `block` | `BLOCK`, `FALLING_DUST`, `DUST_PILLAR`, `BLOCK_MARKER` | `"minecraft:cherry_leaves"` |
+| `item` | `ITEM` | `"DIAMOND"` |
+| `value` | `SCULK_CHARGE` (roll), `SHRIEK` (delay) | `0.5` |
+
+A trail with bad data logs one warning and is skipped.
+
 ## Not built yet
 
 - Paid cosmetics, gift or redeem codes, and achievement unlocks. Today players get cosmetics from an admin grant or by claiming free ones on the web page.
-- Hosting the shared resource pack for custom models, and pushing it to players on join.
-- Live sync: a change on server A, or on the web page, shows up on server B at the player's next join, not instantly.
 - Rate limiting beyond wrong link codes (which is in memory, per instance), key revocation, and Postgres for multi-instance hosting.
-- Hat position is tuned by `hat-offset-y` and still needs checking in game across player poses (sneaking, swimming, elytra).
+- Uploading assets through the API. Today a new model means a commit to `resourcepack/` and an API restart.
+- Pre-1.20.3 clients (via ViaVersion) only hold one server pack, so for them the shared pack and the server's own pack replace each other.
+- The hat pose numbers are worked out from the vanilla player model and still need checking in game, elytra flight especially.

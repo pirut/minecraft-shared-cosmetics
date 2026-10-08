@@ -23,6 +23,8 @@ public final class ApiClient {
     public record PlayerProfile(List<Cosmetic> owned, Map<String, String> equipped) {}
 
     public record LinkCode(String code, String url) {}
+    /** The shared resource pack: where players download it and the SHA-1 their client checks. */
+    public record PackInfo(URI url, String sha1) {}
 
     public static final class ApiException extends RuntimeException {
         public ApiException(String message) {
@@ -46,6 +48,18 @@ public final class ApiClient {
                 cosmetics.add(Cosmetic.fromJson(el.getAsJsonObject()));
             }
             return cosmetics;
+        });
+    }
+
+    /** Completes with null when the API has no pack configured. */
+    public CompletableFuture<PackInfo> fetchPack() {
+        return http.sendAsync(request("/v1/pack").GET().build(), HttpResponse.BodyHandlers.ofString()).thenApply(res -> {
+            if (res.statusCode() == 404) return null;
+            if (res.statusCode() >= 400) throw new ApiException("HTTP " + res.statusCode());
+            JsonObject json = JsonParser.parseString(res.body()).getAsJsonObject();
+            // A CDN url if the API has one, otherwise the API itself serves the zip.
+            String url = json.has("url") ? json.get("url").getAsString() : baseUrl + json.get("path").getAsString();
+            return new PackInfo(URI.create(url), json.get("sha1").getAsString());
         });
     }
 
