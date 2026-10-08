@@ -1,5 +1,5 @@
 import pg from "pg";
-import { toCosmetic, type Cosmetic, type CosmeticRow, type PlayerInfo, type ServerInfo, type Store } from "./db.ts";
+import { groupEquipped, toCosmetic, type Cosmetic, type CosmeticRow, type PlayerInfo, type ServerInfo, type Store } from "./db.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cosmetics (
@@ -44,6 +44,11 @@ CREATE TABLE IF NOT EXISTS web_sessions (
   token_hash  TEXT PRIMARY KEY,
   player_uuid TEXT NOT NULL,
   expires_at  TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS assets (
+  id         TEXT PRIMARY KEY,
+  data       BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS equipped (
   player_uuid TEXT NOT NULL,
@@ -283,5 +288,23 @@ export class PostgresStore implements Store {
 
   async unequip(playerUuid: string, slot: string): Promise<void> {
     await this.pool.query("DELETE FROM equipped WHERE player_uuid = $1 AND slot = $2", [playerUuid, slot]);
+  }
+
+  async equippedMany(playerUuids: string[]): Promise<Record<string, Record<string, string>>> {
+    if (playerUuids.length === 0) return {};
+    const { rows } = await this.pool.query<{ player_uuid: string; slot: string; cosmetic_id: string }>(
+      "SELECT player_uuid, slot, cosmetic_id FROM equipped WHERE player_uuid = ANY($1)",
+      [playerUuids],
+    );
+    return groupEquipped(rows);
+  }
+
+  async putAsset(id: string, data: Buffer): Promise<void> {
+    await this.pool.query("INSERT INTO assets (id, data) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING", [id, data]);
+  }
+
+  async getAsset(id: string): Promise<Buffer | undefined> {
+    const { rows } = await this.pool.query<{ data: Buffer }>("SELECT data FROM assets WHERE id = $1", [id]);
+    return rows[0]?.data;
   }
 }

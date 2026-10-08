@@ -1,0 +1,19 @@
+{
+  "format_version": "1.12.0",
+  "minecraft:geometry": [
+    {
+      "description": { "identifier": "geometry.phoenix_wings", "texture_width": 32, "texture_height": 32 },
+      "bones": [
+        { "name": "wings", "pivot": [0, -3, 2.5] },
+        {
+          "name": "left_wing", "parent": "wings", "pivot": [1.5, -3, 2.5], "rotation": [0, -25, 0],
+          "cubes": [{ "origin": [1.5, -13, 2.5], "size": [12, 10, 1], "uv": [0, 0] }]
+        },
+        {
+          "name": "right_wing", "parent": "wings", "pivot": [-1.5, -3, 2.5], "rotation": [0, 25, 0],
+          "cubes": [{ "origin": [-13.5, -13, 2.5], "size": [12, 10, 1], "uv": [0, 11], "mirror": true }]
+        }
+      ]
+    }
+  ]
+}

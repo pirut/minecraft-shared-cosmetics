@@ -1,9 +1,15 @@
-export type CosmeticType = "HAT" | "TRAIL";
+export type CosmeticType = "HAT" | "TRAIL" | "BACK" | "PET" | "AURA";
 
-/** Each cosmetic type occupies exactly one equip slot. */
+/**
+ * Each cosmetic type occupies exactly one equip slot. BACK, PET and AURA are drawn only by the
+ * client mod; the plugin has no vanilla way to show them.
+ */
 export const SLOT_FOR_TYPE: Record<CosmeticType, string> = {
   HAT: "head",
   TRAIL: "trail",
+  BACK: "back",
+  PET: "pet",
+  AURA: "aura",
 };
 
 export interface Cosmetic {
@@ -18,6 +24,8 @@ export interface Cosmetic {
    * HAT:   { material: "BLACK_WOOL", kit?: { crown: "tall", brim: "wide", band: true, colors: ["#1c1c21", "#961a22"] } }
    *        or { material: "CARVED_PUMPKIN", itemModel?: "myns:custom_hat" } for a model outside the kit
    * TRAIL: { particle: "HEART", count?: 1 }
+   * Any type may also carry model: { bundle: "<sha256>", bone: "body", animations?: ["idle"] }
+   * for the client mod, which draws that instead of the vanilla fallback.
    */
   data: Record<string, unknown>;
 }
@@ -80,6 +88,19 @@ export interface Store {
   equipped(playerUuid: string): Promise<Record<string, string>>;
   equip(playerUuid: string, slot: string, cosmeticId: string): Promise<void>;
   unequip(playerUuid: string, slot: string): Promise<void>;
+  /** Equipped cosmetics for many players at once; players with nothing equipped are left out. */
+  equippedMany(playerUuids: string[]): Promise<Record<string, Record<string, string>>>;
+
+  /** Model bundles for the client mod, keyed by the hex SHA-256 of their bytes. */
+  putAsset(id: string, data: Buffer): Promise<void>;
+  getAsset(id: string): Promise<Buffer | undefined>;
+}
+
+/** Groups equipped rows by player. */
+export function groupEquipped(rows: { player_uuid: string; slot: string; cosmetic_id: string }[]) {
+  const result: Record<string, Record<string, string>> = {};
+  for (const r of rows) (result[r.player_uuid] ??= {})[r.slot] = r.cosmetic_id;
+  return result;
 }
 
 /** Postgres when `url` is a postgres:// URL, otherwise a SQLite file path (or ":memory:"). */

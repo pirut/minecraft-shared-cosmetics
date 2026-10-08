@@ -28,11 +28,7 @@ function listFiles(dir: string): string[] {
 export function buildPack(dir: string = DEFAULT_PACK_DIR): ResourcePack {
   const files = listFiles(dir);
   if (!files.includes("pack.mcmeta")) throw new Error(`${dir} has no pack.mcmeta`);
-
-  const locals: Buffer[] = [];
-  const centrals: Buffer[] = [];
-  let offset = 0;
-  for (const path of files) {
+  const entries = files.map((path) => {
     const data = readFileSync(join(dir, path));
     if (path.endsWith(".json") || path.endsWith(".mcmeta")) {
       try {
@@ -41,6 +37,18 @@ export function buildPack(dir: string = DEFAULT_PACK_DIR): ResourcePack {
         throw new Error(`${path} is not valid JSON: ${(e as Error).message}`);
       }
     }
+    return { name: path, data };
+  });
+  const zip = storedZip(entries);
+  return { zip, sha1: createHash("sha1").update(zip).digest("hex") };
+}
+
+/** Writes entries, in the order given, as an uncompressed zip with fixed timestamps. */
+export function storedZip(entries: { name: string; data: Buffer }[]): Buffer {
+  const locals: Buffer[] = [];
+  const centrals: Buffer[] = [];
+  let offset = 0;
+  for (const { name: path, data } of entries) {
     const name = Buffer.from(path, "utf8");
     const crc = crc32(data);
 
@@ -75,11 +83,9 @@ export function buildPack(dir: string = DEFAULT_PACK_DIR): ResourcePack {
   const centralDir = Buffer.concat(centrals);
   const end = Buffer.alloc(22);
   end.writeUInt32LE(0x06054b50, 0);
-  end.writeUInt16LE(files.length, 8);
-  end.writeUInt16LE(files.length, 10);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
   end.writeUInt32LE(centralDir.length, 12);
   end.writeUInt32LE(offset, 16);
-
-  const zip = Buffer.concat([...locals, centralDir, end]);
-  return { zip, sha1: createHash("sha1").update(zip).digest("hex") };
+  return Buffer.concat([...locals, centralDir, end]);
 }

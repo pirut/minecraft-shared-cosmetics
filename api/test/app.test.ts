@@ -3,6 +3,7 @@ import { after, beforeEach, describe, test } from "node:test";
 import type { FastifyInstance } from "fastify";
 import pg from "pg";
 import { buildApp, normalizeUuid, type AppOptions } from "../src/app.ts";
+import { storedZip } from "../src/pack.ts";
 import type { Store } from "../src/db.ts";
 import { PostgresStore } from "../src/postgres-store.ts";
 import { SqliteStore } from "../src/sqlite-store.ts";
@@ -44,8 +45,8 @@ function postgres(url: string): Backend {
       // First run drops whatever schema was there so the store recreates the current one.
       await client.query(
         store
-          ? "TRUNCATE equipped, ownership, server_keys, servers, cosmetics, players, link_codes, web_sessions"
-          : "DROP TABLE IF EXISTS equipped, ownership, server_keys, servers, cosmetics, players, link_codes, web_sessions",
+          ? "TRUNCATE equipped, ownership, server_keys, servers, cosmetics, players, link_codes, web_sessions, assets"
+          : "DROP TABLE IF EXISTS equipped, ownership, server_keys, servers, cosmetics, players, link_codes, web_sessions, assets",
       );
       await client.end();
       store ??= await PostgresStore.connect(url);
@@ -453,6 +454,31 @@ for (const backend of backends) {
       } finally {
         await app.close();
       }
+    });
+
+    test("client mod: bundles round-trip and equipped cosmetics come back in batches", async () => {
+      const zip = storedZip([
+        { name: "geometry.json", data: Buffer.from("{}") },
+        { name: "texture.png", data: Buffer.from("png") },
+      ]);
+      const up = await app.inject({ method: "PUT", url: "/v1/assets", headers: { ...admin, "content-type": "application/zip" }, payload: zip });
+      assert.equal(up.statusCode, 201);
+      const again = await app.inject({ method: "PUT", url: "/v1/assets", headers: { ...admin, "content-type": "application/zip" }, payload: zip });
+      assert.equal(again.statusCode, 201);
+      const got = await app.inject({ method: "GET", url: `/v1/assets/${up.json().id}` });
+      assert.ok(got.rawPayload.equals(zip));
+
+      const wings = await app.inject({
+        method: "PUT",
+        url: "/v1/cosmetics/wings",
+        headers: admin,
+        payload: { name: "Wings", type: "BACK", data: { model: { bundle: up.json().id, bone: "body" } } },
+      });
+      assert.equal(wings.statusCode, 200);
+      await app.inject({ method: "POST", url: `/v1/players/${PLAYER}/grants`, headers: admin, payload: { cosmeticId: "wings" } });
+      await app.inject({ method: "PUT", url: `/v1/players/${PLAYER}/equipped/back`, headers: server(), payload: { cosmeticId: "wings" } });
+      const res = await app.inject({ method: "POST", url: "/v1/equipped", payload: { players: [PLAYER, "853c80ef3c3749fdaa49938b674adae6"] } });
+      assert.deepEqual(res.json(), { players: { [PLAYER_DASHED]: { back: "wings" } } });
     });
   });
 }
