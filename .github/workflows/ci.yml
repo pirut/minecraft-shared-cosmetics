@@ -7,6 +7,20 @@ on:
 jobs:
   api:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: msc
+          POSTGRES_PASSWORD: msc
+          POSTGRES_DB: msc_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     defaults:
       run:
         working-directory: api
@@ -19,7 +33,12 @@ jobs:
           cache-dependency-path: api/package-lock.json
       - run: npm ci
       - run: npm run typecheck
+      # Runs the suite against SQLite and Postgres.
       - run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://msc:msc@localhost:5432/msc_test
+      # Context is the repo root so the resource pack and web pages ship in the image.
+      - run: docker build -f Dockerfile -t shared-cosmetics-api ..
 
   plugin:
     runs-on: ubuntu-latest

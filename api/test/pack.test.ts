@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { buildApp } from "../src/app.ts";
-import { Store } from "../src/db.ts";
+import { SqliteStore } from "../src/sqlite-store.ts";
 import { buildPack } from "../src/pack.ts";
 
 const ADMIN = "test-admin-token-123456";
@@ -48,7 +48,7 @@ test("pack build rejects broken JSON and folders without pack.mcmeta", () => {
 
 test("api serves pack info and the zip under its hash", async () => {
   const pack = buildPack();
-  const app = buildApp({ store: new Store(":memory:"), adminToken: ADMIN, pack });
+  const app = await buildApp({ store: new SqliteStore(":memory:"), adminToken: ADMIN, pack });
 
   const info = await app.inject({ method: "GET", url: "/v1/pack" });
   assert.equal(info.statusCode, 200);
@@ -65,11 +65,11 @@ test("api serves pack info and the zip under its hash", async () => {
 
 test("pack info points at an external host when one is configured", async () => {
   const pack = buildPack();
-  const app = buildApp({ store: new Store(":memory:"), adminToken: ADMIN, pack, packUrl: "https://cdn.example/p.zip" });
+  const app = await buildApp({ store: new SqliteStore(":memory:"), adminToken: ADMIN, pack, packUrl: "https://cdn.example/p.zip" });
   assert.equal((await app.inject({ method: "GET", url: "/v1/pack" })).json().url, "https://cdn.example/p.zip");
 });
 
 test("pack endpoints 404 when no pack is configured", async () => {
-  const app = buildApp({ store: new Store(":memory:"), adminToken: ADMIN });
+  const app = await buildApp({ store: new SqliteStore(":memory:"), adminToken: ADMIN });
   assert.equal((await app.inject({ method: "GET", url: "/v1/pack" })).statusCode, 404);
 });
