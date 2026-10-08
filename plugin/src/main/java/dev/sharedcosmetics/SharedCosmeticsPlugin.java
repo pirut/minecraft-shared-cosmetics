@@ -9,6 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.PluginCommand;
@@ -29,6 +30,8 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
     private final Map<UUID, Set<String>> owned = new ConcurrentHashMap<>();
     private ApiClient api;
     private CosmeticRenderer renderer;
+    /** Null when resource-pack.enabled is false. */
+    private ResourcePackSender packSender;
 
     @Override
     public void onEnable() {
@@ -43,6 +46,11 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
         renderer = new CosmeticRenderer(this, catalog::get, (float) getConfig().getDouble("hat-offset-y", -0.25));
 
         getServer().getPluginManager().registerEvents(this, this);
+        if (getConfig().getBoolean("resource-pack.enabled", true)) {
+            packSender = new ResourcePackSender(this, getConfig().getBoolean("resource-pack.required", false),
+                    MiniMessage.miniMessage().deserialize(getConfig().getString("resource-pack.prompt", "")));
+            getServer().getPluginManager().registerEvents(packSender, this);
+        }
         PluginCommand command = getCommand("cosmetics");
         if (command != null) command.setExecutor(this);
 
@@ -66,6 +74,14 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
             catalog.putAll(fresh);
             onMain(() -> renderer.reapplyAll());
         });
+        if (packSender == null) return;
+        api.fetchPack().whenComplete((pack, error) -> {
+            if (error != null) {
+                getLogger().warning("Could not fetch the shared resource pack: " + error.getMessage());
+                return;
+            }
+            onMain(() -> packSender.update(pack));
+        });
     }
 
     private void loadPlayer(Player player) {
@@ -84,6 +100,7 @@ public final class SharedCosmeticsPlugin extends JavaPlugin implements Listener,
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
+        if (packSender != null) packSender.send(event.getPlayer());
         loadPlayer(event.getPlayer());
     }
 
