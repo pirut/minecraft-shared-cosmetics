@@ -1,0 +1,8 @@
+# Base URL of the shared cosmetics API.
+api-url: "http://localhost:8080"
+# This server's key, issued once by POST /v1/servers on the API.
+server-key: ""
+# How high above the player's mount point the hat is drawn, in blocks.
+hat-offset-y: -0.25
+# How often trails emit particles, in ticks.
+trail-interval-ticks: 2

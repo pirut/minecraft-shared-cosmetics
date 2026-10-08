@@ -1,0 +1,22 @@
+{
+  "name": "shared-cosmetics-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Central cosmetics registry that participating Minecraft servers talk to.",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.ts",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fastify": "^5.12.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.0"
+  }
+}
