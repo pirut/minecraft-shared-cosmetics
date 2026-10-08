@@ -2,4 +2,5 @@
 !api/package.json
 !api/package-lock.json
 !api/src
+!api/public
 !resourcepack

@@ -10,6 +10,7 @@ COPY api/package.json api/package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY api/src ./src
+COPY api/public ./public
 # The API zips this folder at startup and serves it at /v1/pack/<sha1>.zip.
 COPY resourcepack /app/resourcepack
 

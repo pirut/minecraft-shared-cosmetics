@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Cosmetics Admin</title>
+<style>
+  :root { --bg: #f6f5f2; --card: #fff; --text: #1d1d1b; --muted: #6b6a66; --line: #e2e0da; --accent: #3a7d44; --err: #b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --card: #22221f; --text: #ecebe6; --muted: #a09e97; --line: #3a3934; --accent: #6cbf77; --err: #f2b8b5; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 32px 16px; }
+  h1 { font-size: 1.5rem; margin: 0 0 16px; }
+  h2 { font-size: 1.1rem; margin: 0 0 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+  input, select, textarea { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); min-width: 0; }
+  textarea { font-family: ui-monospace, monospace; font-size: .9rem; width: 100%; min-height: 64px; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--accent); }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: .9rem; color: var(--muted); }
+  label.inline { flex-direction: row; align-items: center; gap: 6px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: 8px 6px; border-top: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; border-top: 0; }
+  .scroll { overflow-x: auto; }
+  code, .mono { font-family: ui-monospace, monospace; font-size: .85rem; }
+  .meta { color: var(--muted); font-size: .9rem; }
+  .msg { min-height: 1.5em; margin-top: 8px; }
+  .msg.error { color: var(--err); }
+  .secret { background: var(--line); padding: 8px; border-radius: 6px; word-break: break-all; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Cosmetics Admin</h1>
+
+  <section class="card" id="auth">
+    <form id="auth-form" class="row">
+      <input id="token" type="password" placeholder="Admin token" autocomplete="current-password" style="flex:1" required>
+      <button type="submit">Unlock</button>
+    </form>
+    <div class="meta">Kept in this tab only and sent as a bearer token.</div>
+    <div class="msg error" id="auth-msg"></div>
+  </section>
+
+  <div id="panel" hidden>
+    <section class="card">
+      <h2>Cosmetics</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Claimable</th><th>Data</th><th></th></tr></thead>
+          <tbody id="cosmetics"></tbody>
+        </table>
+      </div>
+      <h2 style="margin-top:20px">Create or update</h2>
+      <form id="cosmetic-form">
+        <div class="grid">
+          <label>ID <input id="c-id" pattern="[a-z0-9_]{1,64}" placeholder="top_hat" required></label>
+          <label>Name <input id="c-name" maxlength="64" placeholder="Top Hat" required></label>
+          <label>Type
+            <select id="c-type"><option value="HAT">HAT (head)</option><option value="TRAIL">TRAIL (trail)</option></select>
+          </label>
+          <label class="inline"><input type="checkbox" id="c-claimable"> Players can claim it for free</label>
+        </div>
+        <label>Render data (JSON)
+          <textarea id="c-data">{"material": "CARVED_PUMPKIN"}</textarea>
+        </label>
+        <div class="meta">HAT: <code>{"material": "...", "itemModel": "ns:model"}</code>. TRAIL: <code>{"particle": "HEART", "count": 1}</code>.</div>
+        <div class="row" style="margin-top:12px"><button type="submit">Save cosmetic</button></div>
+        <div class="msg" id="cosmetic-msg"></div>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Players</h2>
+      <form id="lookup-form" class="row">
+        <input id="lookup" placeholder="Player name or UUID" style="flex:1" required>
+        <button type="submit">Look up</button>
+      </form>
+      <div class="meta">Names work once the player has joined a participating server.</div>
+      <div class="msg" id="player-msg"></div>
+      <div id="player" hidden>
+        <div><strong id="p-name"></strong> <span class="mono meta" id="p-uuid"></span></div>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Owned</th><th>Slot</th><th>Equipped</th><th></th></tr></thead>
+            <tbody id="p-owned"></tbody>
+          </table>
+        </div>
+        <form id="grant-form" class="row" style="margin-top:12px">
+          <select id="grant-id" style="flex:1"></select>
+          <button type="submit">Grant</button>
+        </form>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Servers</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Name</th><th>ID</th><th>Registered</th><th>Status</th></tr></thead>
+          <tbody id="servers"></tbody>
+        </table>
+      </div>
+      <form id="server-form" class="row" style="margin-top:12px">
+        <input id="s-name" maxlength="64" placeholder="Server name" style="flex:1" required>
+        <button type="submit">Register server</button>
+      </form>
+      <div class="msg" id="server-msg"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let token = "";
+try { token = sessionStorage.getItem("adminToken") || ""; } catch {}
+let catalog = [];
+let current = null;
+
+async function api(method, path, body) {
+  const headers = { Authorization: "Bearer " + token };
+  if (body) headers["Content-Type"] = "application/json";
+  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const data = res.status === 204 ? null : await res.json().catch(() => null);
+  if (!res.ok) throw Object.assign(new Error((data && (data.error || data.message)) || "HTTP " + res.status), { status: res.status });
+  return data;
+}
+
+function say(id, text, isError) {
+  $(id).textContent = text;
+  $(id).className = "msg" + (isError ? " error" : "");
+}
+
+function cell(text, className) {
+  const td = document.createElement("td");
+  td.textContent = text;
+  if (className) td.className = className;
+  return td;
+}
+
+function actionCell(label, onClick) {
+  const td = document.createElement("td");
+  const b = document.createElement("button");
+  b.className = "ghost";
+  b.textContent = label;
+  b.onclick = onClick;
+  td.append(b);
+  return td;
+}
+
+async function loadCosmetics() {
+  catalog = (await api("GET", "/v1/cosmetics")).cosmetics;
+  $("cosmetics").replaceChildren(...catalog.map((c) => {
+    const tr = document.createElement("tr");
+    tr.append(cell(c.id, "mono"), cell(c.name), cell(c.type), cell(c.claimable ? "Yes" : "No"), cell(JSON.stringify(c.data), "mono"),
+      actionCell("Edit", () => {
+        $("c-id").value = c.id;
+        $("c-name").value = c.name;
+        $("c-type").value = c.type;
+        $("c-claimable").checked = c.claimable;
+        $("c-data").value = JSON.stringify(c.data, null, 2);
+        $("c-id").focus();
+      }));
+    return tr;
+  }));
+  $("grant-id").replaceChildren(...catalog.map((c) => {
+    const o = document.createElement("option");
+    o.value = c.id;
+    o.textContent = c.name + " (" + c.id + ")";
+    return o;
+  }));
+}
+
+async function loadServers() {
+  const { servers } = await api("GET", "/v1/servers");
+  $("servers").replaceChildren(...servers.map((s) => {
+    const tr = document.createElement("tr");
+    const status = s.revokedAt ? "Revoked " + new Date(s.revokedAt).toLocaleDateString() : "Active";
+    tr.append(cell(s.name), cell(s.id, "mono"), cell(new Date(s.createdAt).toLocaleString()), cell(status));
+    return tr;
+  }));
+}
+
+function showPlayer(p) {
+  current = p;
+  $("player").hidden = false;
+  $("p-name").textContent = p.name || "Unknown name";
+  $("p-uuid").textContent = p.uuid;
+  const equipped = new Set(Object.values(p.equipped));
+  $("p-owned").replaceChildren(...(p.owned.length ? p.owned.map((c) => {
+    const tr = document.createElement("tr");
+    tr.append(cell(c.name + " (" + c.id + ")"), cell(c.slot), cell(equipped.has(c.id) ? "Yes" : ""),
+      actionCell("Revoke", async () => {
+        try {
+          await api("DELETE", "/v1/players/" + p.uuid + "/grants/" + encodeURIComponent(c.id));
+          await lookup(p.uuid);
+          say("player-msg", "Revoked " + c.name + ".");
+        } catch (e) { say("player-msg", e.message, true); }
+      }));
+    return tr;
+  }) : [(() => { const tr = document.createElement("tr"); tr.append(cell("Owns nothing yet.", "meta")); return tr; })()]));
+}
+
+async function lookup(query) {
+  showPlayer(await api("GET", "/v1/admin/players/" + encodeURIComponent(query.trim())));
+}
+
+$("auth-form").onsubmit = async (e) => {
+  e.preventDefault();
+  token = $("token").value;
+  await unlock();
+};
+
+async function unlock() {
+  try {
+    await Promise.all([loadServers(), loadCosmetics()]);
+    try { sessionStorage.setItem("adminToken", token); } catch {}
+    $("auth").hidden = true;
+    $("panel").hidden = false;
+  } catch (e) {
+    try { sessionStorage.removeItem("adminToken"); } catch {}
+    say("auth-msg", e.status === 401 ? "That token was rejected." : e.message, true);
+  }
+}
+
+$("cosmetic-form").onsubmit = async (e) => {
+  e.preventDefault();
+  let data;
+  try { data = JSON.parse($("c-data").value || "{}"); } catch { return say("cosmetic-msg", "Render data isn't valid JSON.", true); }
+  try {
+    const c = await api("PUT", "/v1/cosmetics/" + encodeURIComponent($("c-id").value), {
+      name: $("c-name").value, type: $("c-type").value, claimable: $("c-claimable").checked, data,
+    });
+    await loadCosmetics();
+    say("cosmetic-msg", "Saved " + c.name + ".");
+  } catch (err) { say("cosmetic-msg", err.message, true); }
+};
+
+$("lookup-form").onsubmit = async (e) => {
+  e.preventDefault();
+  say("player-msg", "");
+  try { await lookup($("lookup").value); } catch (err) { $("player").hidden = true; say("player-msg", err.message, true); }
+};
+
+$("grant-form").onsubmit = async (e) => {
+  e.preventDefault();
+  if (!current) return;
+  try {
+    await api("POST", "/v1/players/" + current.uuid + "/grants", { cosmeticId: $("grant-id").value });
+    await lookup(current.uuid);
+    say("player-msg", "Granted.");
+  } catch (err) { say("player-msg", err.message, true); }
+};
+
+$("server-form").onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const s = await api("POST", "/v1/servers", { name: $("s-name").value });
+    $("s-name").value = "";
+    await loadServers();
+    $("server-msg").className = "msg";
+    $("server-msg").replaceChildren("Put this in the server's config.yml as server-key. It won't be shown again:",
+      Object.assign(document.createElement("div"), { className: "secret mono", textContent: s.key }));
+  } catch (err) { say("server-msg", err.message, true); }
+};
+
+if (token) { $("token").value = token; unlock(); }
+</script>
+</body>
+</html>

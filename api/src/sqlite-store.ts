@@ -1,11 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
-import { toCosmetic, type Cosmetic, type CosmeticRow, type ServerInfo, type Store } from "./db.ts";
+import { toCosmetic, type Cosmetic, type CosmeticRow, type PlayerInfo, type ServerInfo, type Store } from "./db.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cosmetics (
   id         TEXT PRIMARY KEY,
   name       TEXT NOT NULL,
   type       TEXT NOT NULL,
+  claimable  INTEGER NOT NULL DEFAULT 0,
   data       TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL
 );
@@ -28,6 +29,22 @@ CREATE TABLE IF NOT EXISTS ownership (
   granted_at  INTEGER NOT NULL,
   PRIMARY KEY (player_uuid, cosmetic_id)
 );
+CREATE TABLE IF NOT EXISTS players (
+  uuid      TEXT PRIMARY KEY,
+  name      TEXT NOT NULL,
+  last_seen INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS players_name ON players (name COLLATE NOCASE);
+CREATE TABLE IF NOT EXISTS link_codes (
+  code        TEXT PRIMARY KEY,
+  player_uuid TEXT NOT NULL,
+  expires_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS web_sessions (
+  token_hash  TEXT PRIMARY KEY,
+  player_uuid TEXT NOT NULL,
+  expires_at  INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS equipped (
   player_uuid TEXT NOT NULL,
   slot        TEXT NOT NULL,
@@ -46,6 +63,11 @@ export class SqliteStore implements Store {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     this.db.exec(SCHEMA);
+    // Databases created before claimable cosmetics existed.
+    const columns = this.db.prepare("PRAGMA table_info(cosmetics)").all() as unknown as { name: string }[];
+    if (!columns.some((c) => c.name === "claimable")) {
+      this.db.exec("ALTER TABLE cosmetics ADD COLUMN claimable INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   async close(): Promise<void> {
@@ -53,22 +75,23 @@ export class SqliteStore implements Store {
   }
 
   async listCosmetics(): Promise<Cosmetic[]> {
-    const rows = this.db.prepare("SELECT id, name, type, data FROM cosmetics ORDER BY id").all();
+    const rows = this.db.prepare("SELECT id, name, type, claimable, data FROM cosmetics ORDER BY id").all();
     return (rows as unknown as CosmeticRow[]).map(toCosmetic);
   }
 
   async getCosmetic(id: string): Promise<Cosmetic | undefined> {
-    const row = this.db.prepare("SELECT id, name, type, data FROM cosmetics WHERE id = ?").get(id);
+    const row = this.db.prepare("SELECT id, name, type, claimable, data FROM cosmetics WHERE id = ?").get(id);
     return row ? toCosmetic(row as unknown as CosmeticRow) : undefined;
   }
 
   async upsertCosmetic(c: Omit<Cosmetic, "slot">): Promise<Cosmetic> {
     this.db
       .prepare(
-        `INSERT INTO cosmetics (id, name, type, data, created_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET name = excluded.name, type = excluded.type, data = excluded.data`,
+        `INSERT INTO cosmetics (id, name, type, claimable, data, created_at) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name, type = excluded.type,
+           claimable = excluded.claimable, data = excluded.data`,
       )
-      .run(c.id, c.name, c.type, JSON.stringify(c.data), Date.now());
+      .run(c.id, c.name, c.type, c.claimable ? 1 : 0, JSON.stringify(c.data), Date.now());
     return (await this.getCosmetic(c.id))!;
   }
 
@@ -131,10 +154,64 @@ export class SqliteStore implements Store {
     return res.changes > 0;
   }
 
+  async seePlayer(uuid: string, name: string): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO players (uuid, name, last_seen) VALUES (?, ?, ?)
+         ON CONFLICT(uuid) DO UPDATE SET name = excluded.name, last_seen = excluded.last_seen`,
+      )
+      .run(uuid, name, Date.now());
+  }
+
+  async getPlayer(uuid: string): Promise<PlayerInfo | undefined> {
+    return this.db.prepare("SELECT uuid, name FROM players WHERE uuid = ?").get(uuid) as PlayerInfo | undefined;
+  }
+
+  async findPlayerByName(name: string): Promise<PlayerInfo | undefined> {
+    return this.db
+      .prepare("SELECT uuid, name FROM players WHERE name = ? COLLATE NOCASE ORDER BY last_seen DESC LIMIT 1")
+      .get(name) as PlayerInfo | undefined;
+  }
+
+  async createLinkCode(code: string, playerUuid: string, expiresAt: number): Promise<void> {
+    this.db.prepare("DELETE FROM link_codes WHERE player_uuid = ? OR expires_at < ?").run(playerUuid, Date.now());
+    this.db.prepare("INSERT INTO link_codes (code, player_uuid, expires_at) VALUES (?, ?, ?)").run(code, playerUuid, expiresAt);
+  }
+
+  async consumeLinkCode(code: string): Promise<string | undefined> {
+    const row = this.db.prepare("DELETE FROM link_codes WHERE code = ? RETURNING player_uuid, expires_at").get(code) as
+      | { player_uuid: string; expires_at: number }
+      | undefined;
+    return row && row.expires_at > Date.now() ? row.player_uuid : undefined;
+  }
+
+  async createSession(tokenHash: string, playerUuid: string, expiresAt: number): Promise<void> {
+    this.db.prepare("DELETE FROM web_sessions WHERE expires_at < ?").run(Date.now());
+    this.db
+      .prepare("INSERT INTO web_sessions (token_hash, player_uuid, expires_at) VALUES (?, ?, ?)")
+      .run(tokenHash, playerUuid, expiresAt);
+  }
+
+  async findSession(tokenHash: string): Promise<string | undefined> {
+    const row = this.db
+      .prepare("SELECT player_uuid FROM web_sessions WHERE token_hash = ? AND expires_at > ?")
+      .get(tokenHash, Date.now()) as { player_uuid: string } | undefined;
+    return row?.player_uuid;
+  }
+
+  async deleteSession(tokenHash: string): Promise<void> {
+    this.db.prepare("DELETE FROM web_sessions WHERE token_hash = ?").run(tokenHash);
+  }
+
   async grant(playerUuid: string, cosmeticId: string): Promise<void> {
     this.db
       .prepare("INSERT OR IGNORE INTO ownership (player_uuid, cosmetic_id, granted_at) VALUES (?, ?, ?)")
       .run(playerUuid, cosmeticId, Date.now());
+  }
+
+  async revoke(playerUuid: string, cosmeticId: string): Promise<void> {
+    this.db.prepare("DELETE FROM equipped WHERE player_uuid = ? AND cosmetic_id = ?").run(playerUuid, cosmeticId);
+    this.db.prepare("DELETE FROM ownership WHERE player_uuid = ? AND cosmetic_id = ?").run(playerUuid, cosmeticId);
   }
 
   async owns(playerUuid: string, cosmeticId: string): Promise<boolean> {
@@ -146,7 +223,7 @@ export class SqliteStore implements Store {
   async ownedCosmetics(playerUuid: string): Promise<Cosmetic[]> {
     const rows = this.db
       .prepare(
-        `SELECT c.id, c.name, c.type, c.data FROM ownership o
+        `SELECT c.id, c.name, c.type, c.claimable, c.data FROM ownership o
          JOIN cosmetics c ON c.id = o.cosmetic_id
          WHERE o.player_uuid = ? ORDER BY c.id`,
       )

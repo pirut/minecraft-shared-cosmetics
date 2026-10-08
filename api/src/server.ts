@@ -22,6 +22,7 @@ const store = await openStore(env.DATABASE_URL || env.DATABASE_PATH || "cosmetic
 const app = await buildApp({
   store,
   adminToken,
+  publicUrl: env.PUBLIC_URL || undefined,
   logger: true,
   pack,
   packUrl: env.PACK_URL || undefined,

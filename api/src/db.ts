@@ -11,12 +11,19 @@ export interface Cosmetic {
   name: string;
   type: CosmeticType;
   slot: string;
+  /** Players can add it to their account themselves from the web page. */
+  claimable: boolean;
   /**
    * Render hints for the server plugin.
    * HAT:   { material: "CARVED_PUMPKIN", itemModel?: "sharedcosmetics:top_hat" }
    * TRAIL: { particle: "HEART", count?: 1 }
    */
   data: Record<string, unknown>;
+}
+
+export interface PlayerInfo {
+  uuid: string;
+  name: string;
 }
 
 export interface ServerInfo {
@@ -50,7 +57,23 @@ export interface Store {
   /** Permanently disables the server and all its keys. Returns false if it doesn't exist. */
   revokeServer(id: string): Promise<boolean>;
 
+  /** Remembers the latest name a server or link code reported for a uuid. */
+  seePlayer(uuid: string, name: string): Promise<void>;
+  getPlayer(uuid: string): Promise<PlayerInfo | undefined>;
+  /** Case-insensitive; the most recently seen player wins if a name changed hands. */
+  findPlayerByName(name: string): Promise<PlayerInfo | undefined>;
+
+  /** Stores a fresh link code for a player, replacing any earlier one. */
+  createLinkCode(code: string, playerUuid: string, expiresAt: number): Promise<void>;
+  /** Deletes the code and returns its player if it existed and had not expired. */
+  consumeLinkCode(code: string): Promise<string | undefined>;
+  createSession(tokenHash: string, playerUuid: string, expiresAt: number): Promise<void>;
+  findSession(tokenHash: string): Promise<string | undefined>;
+  deleteSession(tokenHash: string): Promise<void>;
+
   grant(playerUuid: string, cosmeticId: string): Promise<void>;
+  /** Takes a cosmetic away, unequipping it first. */
+  revoke(playerUuid: string, cosmeticId: string): Promise<void>;
   owns(playerUuid: string, cosmeticId: string): Promise<boolean>;
   ownedCosmetics(playerUuid: string): Promise<Cosmetic[]>;
   equipped(playerUuid: string): Promise<Record<string, string>>;
@@ -72,6 +95,7 @@ export interface CosmeticRow {
   id: string;
   name: string;
   type: CosmeticType;
+  claimable: number | boolean;
   data: string | Record<string, unknown>;
 }
 
@@ -81,6 +105,7 @@ export function toCosmetic(row: CosmeticRow): Cosmetic {
     name: row.name,
     type: row.type,
     slot: SLOT_FOR_TYPE[row.type],
+    claimable: !!row.claimable,
     data: typeof row.data === "string" ? JSON.parse(row.data) : row.data,
   };
 }

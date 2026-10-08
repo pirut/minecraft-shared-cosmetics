@@ -16,6 +16,7 @@ Cosmetics that follow a player across every server that installs the plugin. A p
 
 - **Identity** is the player's Mojang UUID. Servers must run in `online-mode=true` (or behind a properly configured Velocity/BungeeCord proxy), otherwise anyone can claim any UUID.
 - **Servers** authenticate with a per-server API key. They can read a player's cosmetics and equip or unequip ones the player already owns. Only the admin token can create cosmetics or grant them, so a rogue server can't hand out items.
+- **Players** reach the web page by running `/cosmetics link` in game. The server asks the API for a one-time code (8 characters, 10 minutes) and the player types it on the page, which signs them in with a 30-day cookie tied to their UUID. No Microsoft login is involved: holding the code proves you were online as that player a moment ago. On the page they can equip what they own and claim any cosmetic an admin marked as claimable.
 - **Rendering** uses vanilla client features only. Hats are `ItemDisplay` entities riding the player (hidden from the wearer so they don't block the camera). Trails are particles. Custom 3D hat models come from the shared resource pack (`resourcepack/`), which the plugin sends to players on join; a hat's `itemModel` points at a model in that pack and falls back to its plain `material` for anyone without it.
 
 ## API (`api/`)
@@ -35,30 +36,46 @@ TEST_DATABASE_URL=postgres://user:pass@localhost/scratch npm test   # also Postg
 | `ADMIN_TOKEN` | required | Admin secret, 16+ characters |
 | `DATABASE_URL` | unset | `postgres://…`; use this for hosting and for more than one instance |
 | `DATABASE_PATH` | `cosmetics.db` | SQLite file when `DATABASE_URL` is unset |
+| `PUBLIC_URL` | request host | Address players open, e.g. `https://cosmetics.example.com`; used for the link in game and to mark the cookie `Secure` |
 | `DATABASE_POOL_SIZE` | `10` | Postgres connections per instance |
 | `TRUST_PROXY` | off | Set `true` behind a load balancer so per-IP limits see the real client |
 | `RATE_LIMIT_SERVER_MAX` | `600` | Requests per window per server key |
 | `RATE_LIMIT_ANONYMOUS_MAX` | `60` | Requests per window per IP with no valid key |
 | `RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window |
 | `RATE_LIMIT_DISABLED` | off | Set `true` to turn limits off |
+| `PACK_DIR`, `PACK_URL` | `../resourcepack`, unset | Resource pack source and optional CDN URL (see below) |
+| `HOST`, `PORT` | `0.0.0.0`, `8080` | Listen address |
+
+Web pages:
+
+- `/` is the player page: enter a link code, then equip owned cosmetics and claim free ones.
+- `/admin` is the admin page: paste the admin token to create and edit cosmetics, look players up by name or UUID, grant and revoke, and register servers.
 
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | GET | `/v1/cosmetics` | none | Full catalog with render hints |
 | GET | `/v1/pack` | none | Resource pack SHA-1 and download path (or CDN `url`) |
 | GET | `/v1/pack/:sha1.zip` | none | The resource pack itself |
-| PUT | `/v1/cosmetics/:id` | admin | Create or update a cosmetic |
+| PUT | `/v1/cosmetics/:id` | admin | Create or update a cosmetic (`claimable: true` lets players claim it) |
 | POST | `/v1/servers` | admin | Register a server, returns its key once |
 | GET | `/v1/servers` | admin | List servers and whether they're revoked |
 | POST | `/v1/servers/:id/rotate` | admin | Issue a new key; old keys keep working for `graceSeconds` (default 86400, `0` = now) |
 | DELETE | `/v1/servers/:id` | admin | Revoke a server and every key it has, permanently |
+| GET | `/v1/admin/players/:uuidOrName` | admin | Look a player up by UUID or last reported name |
 | POST | `/v1/players/:uuid/grants` | admin | Give a player a cosmetic |
-| GET | `/v1/players/:uuid` | server | Owned and equipped cosmetics |
+| DELETE | `/v1/players/:uuid/grants/:id` | admin | Take a cosmetic away (and unequip it) |
+| GET | `/v1/players/:uuid?name=` | server | Owned and equipped cosmetics; `name` is remembered for admin lookup |
+| POST | `/v1/players/:uuid/link-codes` | server | One-time code and URL for `/cosmetics link` |
 | PUT | `/v1/players/:uuid/equipped/:slot` | server | Equip an owned cosmetic |
 | DELETE | `/v1/players/:uuid/equipped/:slot` | server | Unequip a slot |
+| POST | `/v1/session` | none | Exchange a link code for a session cookie |
+| DELETE | `/v1/session` | cookie | Sign out |
+| GET | `/v1/me` | cookie | The signed-in player's cosmetics |
+| POST | `/v1/me/claims` | cookie | Claim a claimable cosmetic |
+| PUT / DELETE | `/v1/me/equipped/:slot` | cookie | Equip or unequip from the web |
 | GET | `/v1/events` | server | Server-sent event stream of changes (see below) |
 
-`/v1/events` streams a `player` event (`{uuid, owned, equipped}`) whenever a grant, equip or unequip happens, and a `catalog` event (`{id}`) when a cosmetic is created or updated, with a keep-alive comment every 25 seconds. The plugin uses it so a change on one server shows up on every other server straight away. Events fan out in-process, so this works with a single API instance; several instances would need a shared bus such as Postgres `LISTEN/NOTIFY`.
+`/v1/events` streams a `player` event (`{uuid, owned, equipped}`) whenever a player's cosmetics change (grant, revoke, web claim, equip or unequip from a server or the web page), and a `catalog` event (`{id}`) when a cosmetic is created or updated, with a keep-alive comment every 25 seconds. The plugin uses it so a change on one server shows up on every other server straight away. Events fan out in-process, so this works with a single API instance; several instances would need a shared bus such as Postgres `LISTEN/NOTIFY`.
 
 Cosmetic types and their slots: `HAT` → `head`, `TRAIL` → `trail`.
 
@@ -109,7 +126,7 @@ The pack is optional by default (`resource-pack.required: false`): players who d
 fly launch --no-deploy --copy-config --name <your-app-name>   # creates the app from fly.toml
 fly postgres create --name <your-app-name>-db                 # or point DATABASE_URL at any Postgres
 fly postgres attach <your-app-name>-db                        # sets DATABASE_URL as a secret
-fly secrets set ADMIN_TOKEN=$(openssl rand -base64 32)
+fly secrets set ADMIN_TOKEN=$(openssl rand -base64 32) PUBLIC_URL=https://<your-app-name>.fly.dev
 fly deploy
 fly scale count 1                                             # see the note below on instances
 ```
@@ -127,7 +144,7 @@ cd plugin
 ./gradlew build   # jar lands in build/libs/
 ```
 
-Drop the jar in `plugins/`, start once, then set `api-url` and `server-key` in `plugins/SharedCosmetics/config.yml`. In game: `/cosmetics list`, `/cosmetics equip <id>`, `/cosmetics unequip <head|trail>`.
+Drop the jar in `plugins/`, start once, then set `api-url` and `server-key` in `plugins/SharedCosmetics/config.yml`. In game: `/cosmetics list`, `/cosmetics equip <id>`, `/cosmetics unequip <head|trail>`, `/cosmetics link`.
 
 **Live sync.** With `live-sync: true` (the default) the plugin keeps the `/v1/events` stream open, so equipping a hat on server A puts it on the player's head on server B (and in front of everyone there) right away. If the connection drops it reconnects with backoff and re-fetches every online player, so nothing missed while it was down is lost.
 
@@ -151,8 +168,8 @@ A trail with bad data logs one warning and is skipped.
 
 ## Not built yet
 
-- A way for players to get cosmetics (store, achievements, admin panel). Today only the admin API grants them.
-- Running more than one API instance: live sync needs a shared bus (Postgres LISTEN/NOTIFY) and rate limit counters need a shared store (Redis). Schema migrations are create-if-missing only.
+- Paid cosmetics, gift or redeem codes, and achievement unlocks. Today players get cosmetics from an admin grant or by claiming free ones on the web page.
+- Running more than one API instance: live sync needs a shared bus (Postgres LISTEN/NOTIFY), and rate limit counters (including wrong link codes) need a shared store (Redis). Schema migrations are create-if-missing only.
 - Uploading assets through the API. Today a new model means a commit to `resourcepack/` and an API restart.
 - Pre-1.20.3 clients (via ViaVersion) only hold one server pack, so for them the shared pack and the server's own pack replace each other.
 - The hat pose numbers are worked out from the vanilla player model and still need checking in game, elytra flight especially.

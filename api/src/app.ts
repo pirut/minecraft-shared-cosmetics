@@ -1,4 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import rateLimit from "@fastify/rate-limit";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { SLOT_FOR_TYPE, type CosmeticType, type Store } from "./db.ts";
@@ -19,6 +20,8 @@ export interface AppOptions {
   store: Store;
   /** Token for catalog management, server registration and grants. */
   adminToken: string;
+  /** Where players reach the web pages, e.g. https://cosmetics.example.com. Defaults to the request's host. */
+  publicUrl?: string;
   logger?: boolean;
   /** Trust X-Forwarded-For from a load balancer (Fly, Railway, nginx) so per-IP limits see the real client. */
   trustProxy?: boolean;
@@ -30,6 +33,36 @@ export interface AppOptions {
   packUrl?: string;
   /** How often the event stream sends a keep-alive comment, so servers can spot dead connections. */
   heartbeatMs?: number;
+}
+
+const LINK_CODE_TTL_MS = 10 * 60 * 1000;
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_COOKIE = "msc_session";
+// No 0/O or 1/I so codes survive being read off a Minecraft chat line.
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const LINK_FAILURES_PER_WINDOW = 10;
+const LINK_FAILURE_WINDOW_MS = 10 * 60 * 1000;
+
+const PAGES = {
+  player: readFileSync(new URL("../public/index.html", import.meta.url), "utf8"),
+  admin: readFileSync(new URL("../public/admin.html", import.meta.url), "utf8"),
+};
+
+/** Eight characters from CODE_ALPHABET, shown to players as XXXX-XXXX. */
+export function newLinkCode(): string {
+  return Array.from(randomBytes(8), (b) => CODE_ALPHABET[b % CODE_ALPHABET.length]).join("");
+}
+
+function normalizeLinkCode(raw: string): string {
+  return raw.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function cookie(req: FastifyRequest, name: string): string | undefined {
+  for (const part of (req.headers.cookie ?? "").split(";")) {
+    const [k, ...v] = part.trim().split("=");
+    if (k === name) return decodeURIComponent(v.join("="));
+  }
+  return undefined;
 }
 
 type Caller = { kind: "admin" } | { kind: "server"; id: string } | { kind: "anonymous" };
@@ -72,6 +105,8 @@ function safeEqual(a: string, b: string): boolean {
 export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   const { store, adminToken } = opts;
   const app = Fastify({ logger: opts.logger ?? false, trustProxy: opts.trustProxy ?? false });
+  const publicUrl = (req: FastifyRequest) => (opts.publicUrl ?? `${req.protocol}://${req.host}`).replace(/\/+$/, "");
+  const linkFailures = new Map<string, { count: number; resetAt: number }>();
   const feed = new ChangeFeed();
   const closeStreams = new Set<() => void>();
 
@@ -121,6 +156,33 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     if (req.caller.kind !== "server") return reply.code(401).send({ error: "valid server key required" });
   };
 
+  const sessionPlayer = async (req: FastifyRequest): Promise<string | undefined> => {
+    const token = cookie(req, SESSION_COOKIE);
+    return token ? store.findSession(hashKey(token)) : undefined;
+  };
+
+  const requireSession = async (req: FastifyRequest, reply: FastifyReply) => {
+    if (!(await sessionPlayer(req))) return reply.code(401).send({ error: "not linked" });
+  };
+
+  const profile = async (uuid: string) => ({
+    uuid,
+    name: (await store.getPlayer(uuid))?.name ?? null,
+    owned: await store.ownedCosmetics(uuid),
+    equipped: await store.equipped(uuid),
+  });
+
+  /** Shared by servers and the player's own web session; only owned cosmetics can be equipped. */
+  const equip = async (uuid: string, slot: string, cosmeticId: string, reply: FastifyReply) => {
+    const cosmetic = await store.getCosmetic(cosmeticId);
+    if (!cosmetic) return reply.code(404).send({ error: "unknown cosmetic" });
+    if (cosmetic.slot !== slot) return reply.code(400).send({ error: `cosmetic belongs in slot "${cosmetic.slot}"` });
+    if (!(await store.owns(uuid, cosmetic.id))) return reply.code(403).send({ error: "player does not own this cosmetic" });
+    await store.equip(uuid, slot, cosmetic.id);
+    await publishPlayer(uuid);
+    return { uuid, equipped: await store.equipped(uuid) };
+  };
+
   const newServerKey = () => `msc_${randomBytes(24).toString("base64url")}`;
 
   const playerUuid = (req: FastifyRequest, reply: FastifyReply): string | undefined => {
@@ -130,6 +192,9 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   };
 
   app.get("/health", { config: { rateLimit: false } }, async () => ({ ok: true }));
+
+  app.get("/", async (_req, reply) => reply.type("text/html; charset=utf-8").send(PAGES.player));
+  app.get("/admin", async (_req, reply) => reply.type("text/html; charset=utf-8").send(PAGES.admin));
 
   // Public: the whole catalog, so servers can cache render hints.
   app.get("/v1/cosmetics", async () => ({ cosmetics: await store.listCosmetics() }));
@@ -152,7 +217,10 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       .send(pack.zip);
   });
 
-  app.put<{ Params: { id: string }; Body: { name: string; type: CosmeticType; data?: Record<string, unknown> } }>(
+  app.put<{
+    Params: { id: string };
+    Body: { name: string; type: CosmeticType; claimable?: boolean; data?: Record<string, unknown> };
+  }>(
     "/v1/cosmetics/:id",
     {
       preHandler: requireAdmin,
@@ -164,13 +232,20 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
           properties: {
             name: { type: "string", minLength: 1, maxLength: 64 },
             type: { type: "string", enum: Object.keys(SLOT_FOR_TYPE) },
+            claimable: { type: "boolean" },
             data: { type: "object" },
           },
         },
       },
     },
     async (req) => {
-      const cosmetic = await store.upsertCosmetic({ id: req.params.id, name: req.body.name, type: req.body.type, data: req.body.data ?? {} });
+      const cosmetic = await store.upsertCosmetic({
+        id: req.params.id,
+        name: req.body.name,
+        type: req.body.type,
+        claimable: req.body.claimable ?? false,
+        data: req.body.data ?? {},
+      });
       feed.publish({ type: "catalog", id: cosmetic.id });
       return cosmetic;
     },
@@ -228,6 +303,13 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     return reply.code(204).send();
   });
 
+  // Admin lookup by uuid or by any name a server has reported.
+  app.get<{ Params: { query: string } }>("/v1/admin/players/:query", { preHandler: requireAdmin }, async (req, reply) => {
+    const uuid = normalizeUuid(req.params.query) ?? (await store.findPlayerByName(req.params.query))?.uuid;
+    if (!uuid) return reply.code(404).send({ error: "no player with that uuid or name has been seen yet" });
+    return profile(uuid);
+  });
+
   app.post<{ Params: { uuid: string }; Body: { cosmeticId: string } }>(
     "/v1/players/:uuid/grants",
     {
@@ -246,11 +328,52 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     },
   );
 
-  app.get<{ Params: { uuid: string } }>("/v1/players/:uuid", { preHandler: requireServer }, async (req, reply) => {
-    const uuid = playerUuid(req, reply);
-    if (!uuid) return;
-    return { uuid, owned: await store.ownedCosmetics(uuid), equipped: await store.equipped(uuid) };
-  });
+  app.delete<{ Params: { uuid: string; cosmeticId: string } }>(
+    "/v1/players/:uuid/grants/:cosmeticId",
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const uuid = playerUuid(req, reply);
+      if (!uuid) return;
+      await store.revoke(uuid, req.params.cosmeticId);
+      await publishPlayer(uuid);
+      return reply.code(204).send();
+    },
+  );
+
+  // Servers pass ?name= so admins can find players by name later.
+  app.get<{ Params: { uuid: string }; Querystring: { name?: string } }>(
+    "/v1/players/:uuid",
+    {
+      preHandler: requireServer,
+      schema: { querystring: { type: "object", properties: { name: { type: "string", pattern: "^[A-Za-z0-9_]{1,16}$" } } } },
+    },
+    async (req, reply) => {
+      const uuid = playerUuid(req, reply);
+      if (!uuid) return;
+      if (req.query.name) await store.seePlayer(uuid, req.query.name);
+      return profile(uuid);
+    },
+  );
+
+  // A server asks for a one-time code on behalf of an online player (/cosmetics link).
+  // The player types it into the web page to prove they own the account, no Microsoft login needed.
+  app.post<{ Params: { uuid: string }; Body: { name?: string } }>(
+    "/v1/players/:uuid/link-codes",
+    {
+      preHandler: requireServer,
+      schema: { body: { type: "object", properties: { name: { type: "string", pattern: "^[A-Za-z0-9_]{1,16}$" } } } },
+    },
+    async (req, reply) => {
+      const uuid = playerUuid(req, reply);
+      if (!uuid) return;
+      if (req.body?.name) await store.seePlayer(uuid, req.body.name);
+      const code = newLinkCode();
+      const expiresAt = Date.now() + LINK_CODE_TTL_MS;
+      await store.createLinkCode(code, uuid, expiresAt);
+      const display = `${code.slice(0, 4)}-${code.slice(4)}`;
+      return reply.code(201).send({ code: display, expiresAt, url: `${publicUrl(req)}/?code=${display}` });
+    },
+  );
 
   app.put<{ Params: { uuid: string; slot: string }; Body: { cosmeticId: string } }>(
     "/v1/players/:uuid/equipped/:slot",
@@ -263,14 +386,8 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     async (req, reply) => {
       const uuid = playerUuid(req, reply);
       if (!uuid) return;
-      const cosmetic = await store.getCosmetic(req.body.cosmeticId);
-      if (!cosmetic) return reply.code(404).send({ error: "unknown cosmetic" });
-      if (cosmetic.slot !== req.params.slot) return reply.code(400).send({ error: `cosmetic belongs in slot "${cosmetic.slot}"` });
-      // Servers may only equip what the player already owns; only admins grant.
-      if (!(await store.owns(uuid, cosmetic.id))) return reply.code(403).send({ error: "player does not own this cosmetic" });
-      await store.equip(uuid, req.params.slot, cosmetic.id);
-      await publishPlayer(uuid);
-      return { uuid, equipped: await store.equipped(uuid) };
+      // Servers may only equip what the player already owns; they can never grant.
+      return equip(uuid, req.params.slot, req.body.cosmeticId, reply);
     },
   );
 
@@ -285,6 +402,76 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       return { uuid, equipped: await store.equipped(uuid) };
     },
   );
+
+  // Player web session. Exchanging a link code sets an httpOnly cookie tied to the code's uuid.
+  app.post<{ Body: { code: string } }>(
+    "/v1/session",
+    { schema: { body: { type: "object", required: ["code"], properties: { code: { type: "string", maxLength: 32 } } } } },
+    async (req, reply) => {
+      const now = Date.now();
+      const failures = linkFailures.get(req.ip);
+      if (failures && failures.resetAt > now && failures.count >= LINK_FAILURES_PER_WINDOW) {
+        return reply.code(429).send({ error: "too many wrong codes, try again in a few minutes" });
+      }
+      const uuid = await store.consumeLinkCode(normalizeLinkCode(req.body.code));
+      if (!uuid) {
+        const entry = failures && failures.resetAt > now ? failures : { count: 0, resetAt: now + LINK_FAILURE_WINDOW_MS };
+        entry.count++;
+        linkFailures.set(req.ip, entry);
+        return reply.code(400).send({ error: "that code is wrong or has expired, run /cosmetics link again" });
+      }
+      const token = randomBytes(32).toString("base64url");
+      await store.createSession(hashKey(token), uuid, now + SESSION_TTL_MS);
+      const secure = publicUrl(req).startsWith("https:") ? "; Secure" : "";
+      reply.header(
+        "Set-Cookie",
+        `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}${secure}`,
+      );
+      return profile(uuid);
+    },
+  );
+
+  app.delete("/v1/session", async (req, reply) => {
+    const token = cookie(req, SESSION_COOKIE);
+    if (token) await store.deleteSession(hashKey(token));
+    reply.header("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+    return reply.code(204).send();
+  });
+
+  app.get("/v1/me", { preHandler: requireSession }, async (req) => profile((await sessionPlayer(req))!));
+
+  app.post<{ Body: { cosmeticId: string } }>(
+    "/v1/me/claims",
+    {
+      preHandler: requireSession,
+      schema: { body: { type: "object", required: ["cosmeticId"], properties: { cosmeticId: { type: "string" } } } },
+    },
+    async (req, reply) => {
+      const uuid = (await sessionPlayer(req))!;
+      const cosmetic = await store.getCosmetic(req.body.cosmeticId);
+      if (!cosmetic) return reply.code(404).send({ error: "unknown cosmetic" });
+      if (!cosmetic.claimable) return reply.code(403).send({ error: "this cosmetic can't be claimed" });
+      await store.grant(uuid, cosmetic.id);
+      await publishPlayer(uuid);
+      return profile(uuid);
+    },
+  );
+
+  app.put<{ Params: { slot: string }; Body: { cosmeticId: string } }>(
+    "/v1/me/equipped/:slot",
+    {
+      preHandler: requireSession,
+      schema: { body: { type: "object", required: ["cosmeticId"], properties: { cosmeticId: { type: "string" } } } },
+    },
+    async (req, reply) => equip((await sessionPlayer(req))!, req.params.slot, req.body.cosmeticId, reply),
+  );
+
+  app.delete<{ Params: { slot: string } }>("/v1/me/equipped/:slot", { preHandler: requireSession }, async (req) => {
+    const uuid = (await sessionPlayer(req))!;
+    await store.unequip(uuid, req.params.slot);
+    await publishPlayer(uuid);
+    return { uuid, equipped: await store.equipped(uuid) };
+  });
 
   // Server-sent events: every change to any player or the catalog, as it happens, so a cosmetic
   // equipped on one server shows up on the others without the player rejoining.
